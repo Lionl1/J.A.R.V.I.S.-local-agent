@@ -1,0 +1,764 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>J.A.R.V.I.S. Terminal</title>
+    <style>
+      :root {
+        --bg-0: #050910;
+        --bg-1: #0a1624;
+        --bg-2: #0f2236;
+        --line: #1b3b58;
+        --text: #d6ecff;
+        --muted: #7aa0bd;
+        --neon: #29c6ff;
+        --neon-soft: rgba(41, 198, 255, 0.24);
+        --ok: #33ffc1;
+        --warn: #ff5f7a;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        background-color: #050910;
+        font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Consolas,
+          "Liberation Mono", Menlo, monospace;
+        color: var(--text);
+        background: radial-gradient(circle at 15% 15%, #0f2740 0%, var(--bg-0) 40%),
+          linear-gradient(145deg, #04070d 0%, #0b1320 55%, #060a11 100%);
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image: linear-gradient(
+            rgba(41, 198, 255, 0.07) 1px,
+            transparent 1px
+          ),
+          linear-gradient(90deg, rgba(41, 198, 255, 0.05) 1px, transparent 1px);
+        background-size: 30px 30px;
+        mix-blend-mode: screen;
+        opacity: 0.5;
+      }
+
+      .app {
+        position: relative;
+        z-index: 1;
+        min-height: 100%;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+
+      .panel {
+        width: min(980px, 100%);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: linear-gradient(180deg, rgba(10, 22, 36, 0.9), rgba(8, 16, 27, 0.85));
+        box-shadow: 0 0 0 1px rgba(41, 198, 255, 0.12),
+          0 18px 52px rgba(2, 7, 16, 0.78),
+          inset 0 0 48px rgba(41, 198, 255, 0.08);
+        overflow: hidden;
+      }
+
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--line);
+        background: linear-gradient(90deg, rgba(19, 41, 65, 0.7), rgba(5, 12, 20, 0.5));
+      }
+
+      .logo {
+        letter-spacing: 0.14em;
+        font-size: 13px;
+        color: #c3eaff;
+      }
+
+      .status-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--muted);
+        box-shadow: 0 0 0 transparent;
+        transition: all 0.2s ease;
+      }
+
+      .status-dot.listening {
+        background: var(--ok);
+        box-shadow: 0 0 12px rgba(51, 255, 193, 0.9);
+      }
+
+      .status-dot.thinking,
+      .status-dot.executing {
+        background: var(--neon);
+        box-shadow: 0 0 14px rgba(41, 198, 255, 0.95);
+        animation: pulse 1.1s infinite;
+      }
+
+      .status-dot.listening_mic {
+        background: #ff5f7a;
+        box-shadow: 0 0 14px rgba(255, 95, 122, 0.95);
+        animation: pulse 0.75s infinite;
+      }
+
+      .status-dot.error {
+        background: var(--warn);
+        box-shadow: 0 0 12px rgba(255, 95, 122, 0.9);
+      }
+
+      @keyframes pulse {
+        0% {
+          transform: scale(1);
+          opacity: 1;
+        }
+        50% {
+          transform: scale(1.45);
+          opacity: 0.5;
+        }
+        100% {
+          transform: scale(1);
+          opacity: 1;
+        }
+      }
+
+      .screen {
+        display: none;
+      }
+
+      .screen.active {
+        display: block;
+      }
+
+      .auth {
+        padding: 44px 28px;
+      }
+
+      .auth-box {
+        max-width: 520px;
+        margin: 8px auto;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 20px;
+        background: rgba(7, 16, 27, 0.75);
+      }
+
+      .title {
+        font-size: 18px;
+        margin: 0 0 10px;
+        color: #e4f4ff;
+      }
+
+      .subtitle {
+        margin: 0 0 18px;
+        font-size: 13px;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .row {
+        display: flex;
+        gap: 10px;
+      }
+
+      input,
+      button {
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        padding: 11px 12px;
+        font: inherit;
+      }
+
+      input {
+        width: 100%;
+        background: #071321;
+        color: var(--text);
+        outline: none;
+      }
+
+      input:focus {
+        border-color: var(--neon);
+        box-shadow: 0 0 0 3px var(--neon-soft);
+      }
+
+      button {
+        cursor: pointer;
+        background: linear-gradient(180deg, #1b9fd1, #13749b);
+        color: #eaf9ff;
+        min-width: 126px;
+        font-weight: 600;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .auth-error {
+        margin-top: 12px;
+        font-size: 13px;
+        color: var(--warn);
+        min-height: 18px;
+      }
+
+      .chat {
+        height: min(82vh, 760px);
+        display: grid;
+        grid-template-rows: 1fr auto;
+      }
+
+      .chat-log {
+        padding: 18px;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 11px;
+      }
+
+      .msg {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 10px 12px;
+        max-width: 90%;
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.45;
+        font-size: 14px;
+      }
+
+      .msg.you {
+        align-self: flex-end;
+        background: rgba(21, 52, 80, 0.55);
+        border-color: #2a5f8d;
+      }
+
+      .msg.jarvis {
+        align-self: flex-start;
+        background: rgba(8, 27, 43, 0.75);
+      }
+
+      .msg.error {
+        align-self: flex-start;
+        background: rgba(68, 15, 24, 0.4);
+        border-color: rgba(255, 95, 122, 0.6);
+        color: #ffadbb;
+      }
+
+      .msg .meta {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+
+      .composer {
+        border-top: 1px solid var(--line);
+        padding: 12px;
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 10px;
+        background: rgba(8, 16, 27, 0.7);
+      }
+
+      #voiceBtn.recording {
+        background: linear-gradient(180deg, #d12a4a, #982039);
+      }
+
+      .hint {
+        font-size: 11px;
+        color: var(--muted);
+        padding: 0 16px 12px;
+      }
+
+      @media (max-width: 760px) {
+        .app {
+          padding: 10px;
+        }
+        .chat {
+          height: 86vh;
+        }
+        button {
+          min-width: 102px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel">
+        <div class="topbar">
+          <div class="logo">J.A.R.V.I.S. LOCAL TERMINAL</div>
+          <div class="status-wrap">
+            <span id="statusDot" class="status-dot"></span>
+            <span id="statusText">offline</span>
+          </div>
+        </div>
+
+        <div id="authScreen" class="screen auth active">
+          <div class="auth-box">
+            <h1 class="title">Авторизация</h1>
+            <p class="subtitle">
+              Введите API_KEY для подключения к серверу J.A.R.V.I.S.<br />
+              Ключ отправляется как query-параметр <code>?token=...</code>.
+            </p>
+            <div class="row">
+              <input
+                id="apiKeyInput"
+                type="password"
+                placeholder="JARVIS_API_KEY"
+                autocomplete="off"
+              />
+              <button id="connectBtn">Подключиться</button>
+            </div>
+            <div id="authError" class="auth-error"></div>
+          </div>
+        </div>
+
+        <div id="chatScreen" class="screen chat">
+          <div id="chatLog" class="chat-log"></div>
+          <div class="composer">
+            <input
+              id="messageInput"
+              type="text"
+              placeholder="Введите команду..."
+              autocomplete="off"
+            />
+            <button id="voiceBtn" type="button">Голос</button>
+            <button id="sendBtn">Отправить</button>
+          </div>
+          <div class="hint">Enter: отправить команду</div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const state = {
+        ws: null,
+        apiKey: "",
+        typewriterQueue: Promise.resolve(),
+        audioQueue: Promise.resolve(),
+        currentAudio: null,
+        audioUnlocked: false,
+        mediaRecorder: null,
+        recordedChunks: [],
+        activeStream: null,
+      };
+
+      const authScreen = document.getElementById("authScreen");
+      const chatScreen = document.getElementById("chatScreen");
+      const apiKeyInput = document.getElementById("apiKeyInput");
+      const connectBtn = document.getElementById("connectBtn");
+      const authError = document.getElementById("authError");
+
+      const chatLog = document.getElementById("chatLog");
+      const messageInput = document.getElementById("messageInput");
+      const sendBtn = document.getElementById("sendBtn");
+      const voiceBtn = document.getElementById("voiceBtn");
+      const statusText = document.getElementById("statusText");
+      const statusDot = document.getElementById("statusDot");
+
+      function getWsUrl(token) {
+        const proto = window.location.protocol === "https:" ? "wss" : "ws";
+        const host = window.location.host;
+        return `${proto}://${host}/ws/jarvis?token=${encodeURIComponent(token)}`;
+      }
+
+      function setStatus(status) {
+        const value = status || "offline";
+        statusText.textContent = value;
+        statusDot.className = "status-dot";
+
+        if (["listening", "listening_mic", "thinking", "executing", "error"].includes(value)) {
+          statusDot.classList.add(value);
+        }
+      }
+
+      function switchToChat() {
+        authScreen.classList.remove("active");
+        chatScreen.classList.add("active");
+        messageInput.focus();
+      }
+
+      function switchToAuth(errorMessage = "") {
+        chatScreen.classList.remove("active");
+        authScreen.classList.add("active");
+        authError.textContent = errorMessage;
+        connectBtn.disabled = false;
+        setStatus("offline");
+      }
+
+      function appendMessage(role, text) {
+        const item = document.createElement("div");
+        item.className = `msg ${role}`;
+
+        const meta = document.createElement("span");
+        meta.className = "meta";
+        meta.textContent = role === "you" ? "Вы" : role === "jarvis" ? "J.A.R.V.I.S." : "Ошибка";
+
+        const body = document.createElement("div");
+        body.textContent = text;
+
+        item.appendChild(meta);
+        item.appendChild(body);
+        chatLog.appendChild(item);
+        chatLog.scrollTop = chatLog.scrollHeight;
+        return body;
+      }
+
+      function appendTypewriterMessage(text) {
+        state.typewriterQueue = state.typewriterQueue.then(async () => {
+          const body = appendMessage("jarvis", "");
+          for (const ch of text) {
+            body.textContent += ch;
+            chatLog.scrollTop = chatLog.scrollHeight;
+            await new Promise((r) => setTimeout(r, 11));
+          }
+        });
+      }
+
+      async function unlockAudio() {
+        if (state.audioUnlocked) return true;
+        try {
+          // Короткий "тихий" data-uri для разблокировки autoplay-политики браузера.
+          const warmup = new Audio(
+            "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA="
+          );
+          warmup.volume = 0;
+          await warmup.play();
+          warmup.pause();
+          state.audioUnlocked = true;
+          return true;
+        } catch {
+          state.audioUnlocked = false;
+          return false;
+        }
+      }
+
+      function playBase64Audio(base64Payload) {
+        return new Promise((resolve) => {
+          const audio = new Audio(`data:audio/mp3;base64,${base64Payload}`);
+          state.currentAudio = audio;
+
+          const cleanup = () => {
+            if (state.currentAudio === audio) {
+              state.currentAudio = null;
+            }
+            resolve();
+          };
+
+          audio.onended = cleanup;
+          audio.onerror = () => {
+            appendMessage("error", "Не удалось воспроизвести аудио");
+            cleanup();
+          };
+
+          audio.play().catch(async (err) => {
+            // Пробуем один ретрай после unlock (если браузер блокирует autoplay).
+            const ok = await unlockAudio();
+            if (ok) {
+              audio.play().catch((innerErr) => {
+                appendMessage(
+                  "error",
+                  `Не удалось воспроизвести аудио: ${innerErr.message || innerErr}`
+                );
+                cleanup();
+              });
+              return;
+            }
+            appendMessage("error", `Не удалось воспроизвести аудио: ${err.message || err}`);
+            cleanup();
+          });
+        });
+      }
+
+      function enqueueBase64Audio(base64Payload) {
+        state.audioQueue = state.audioQueue.then(() => playBase64Audio(base64Payload));
+      }
+
+      function handleServerMessage(rawData) {
+        let msg;
+        try {
+          msg = JSON.parse(rawData);
+        } catch (e) {
+          appendMessage("error", "Некорректный JSON от сервера");
+          return;
+        }
+
+        const { type, payload } = msg;
+
+        if (type === "status") {
+          setStatus(payload);
+          return;
+        }
+
+        if (type === "text") {
+          appendMessage("you", String(payload || ""));
+          return;
+        }
+
+        if (type === "speech_text") {
+          appendTypewriterMessage(String(payload || ""));
+          return;
+        }
+
+        if (type === "audio") {
+          if (payload) {
+            enqueueBase64Audio(payload);
+          }
+          return;
+        }
+
+        if (type === "error") {
+          appendMessage("error", String(payload || "Неизвестная ошибка"));
+          setStatus("error");
+          return;
+        }
+
+        appendMessage("error", `Неизвестный тип сообщения: ${type}`);
+      }
+
+      function connect() {
+        const key = apiKeyInput.value.trim();
+        if (!key) {
+          authError.textContent = "Введите API_KEY";
+          return;
+        }
+
+        connectBtn.disabled = true;
+        authError.textContent = "Подключение...";
+        // Подхватываем user gesture для разрешения звука.
+        unlockAudio();
+
+        const ws = new WebSocket(getWsUrl(key));
+        state.ws = ws;
+        state.apiKey = key;
+
+        ws.onopen = () => {
+          authError.textContent = "";
+          switchToChat();
+          setStatus("listening");
+          appendMessage("jarvis", "Подключение установлено. Ожидаю команду.");
+        };
+
+        ws.onmessage = (event) => {
+          handleServerMessage(event.data);
+        };
+
+        ws.onerror = () => {
+          appendMessage("error", "Ошибка WebSocket-соединения");
+          setStatus("error");
+        };
+
+        ws.onclose = (event) => {
+          state.ws = null;
+          if (state.currentAudio) {
+            state.currentAudio.pause();
+            state.currentAudio.currentTime = 0;
+            state.currentAudio = null;
+          }
+          state.audioQueue = Promise.resolve();
+          if (state.mediaRecorder && state.mediaRecorder.state === "recording") {
+            state.mediaRecorder.stop();
+          }
+          if (state.activeStream) {
+            state.activeStream.getTracks().forEach((t) => t.stop());
+            state.activeStream = null;
+          }
+          voiceBtn.classList.remove("recording");
+          voiceBtn.textContent = "Голос";
+
+          if (!chatScreen.classList.contains("active")) {
+            const reason = event.code === 4003
+              ? "Неверный API_KEY"
+              : `Соединение закрыто (code ${event.code})`;
+            switchToAuth(reason);
+            return;
+          }
+
+          const reason = event.code === 4003
+            ? "Доступ запрещен: неверный API_KEY"
+            : `Соединение закрыто (code ${event.code})`;
+
+          appendMessage("error", reason);
+          switchToAuth(reason);
+        };
+      }
+
+      function sendTextMessage() {
+        const text = messageInput.value.trim();
+        if (!text) return;
+
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          appendMessage("error", "Нет активного WebSocket-подключения");
+          return;
+        }
+
+        unlockAudio();
+        const payload = { type: "text", payload: text };
+        state.ws.send(JSON.stringify(payload));
+        appendMessage("you", text);
+        messageInput.value = "";
+        messageInput.focus();
+      }
+
+      function blobToBase64(blob) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const result = String(reader.result || "");
+            const marker = "base64,";
+            const idx = result.indexOf(marker);
+            if (idx === -1) {
+              reject(new Error("Failed to encode audio as base64"));
+              return;
+            }
+            resolve(result.slice(idx + marker.length));
+          };
+          reader.onerror = () => reject(new Error("FileReader error"));
+          reader.readAsDataURL(blob);
+        });
+      }
+
+      function getPreferredAudioMimeType() {
+        const candidates = [
+          "audio/webm;codecs=opus",
+          "audio/webm",
+          "audio/ogg;codecs=opus",
+          "audio/ogg",
+        ];
+        for (const mime of candidates) {
+          if (MediaRecorder.isTypeSupported(mime)) {
+            return mime;
+          }
+        }
+        return "";
+      }
+
+      async function toggleVoiceRecording() {
+        await unlockAudio();
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          appendMessage("error", "Нет активного WebSocket-подключения");
+          return;
+        }
+
+        if (state.mediaRecorder && state.mediaRecorder.state === "recording") {
+          state.mediaRecorder.stop();
+          return;
+        }
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          appendMessage("error", "Браузер не поддерживает запись микрофона");
+          return;
+        }
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const mimeType = getPreferredAudioMimeType();
+          const recorder = mimeType
+            ? new MediaRecorder(stream, { mimeType })
+            : new MediaRecorder(stream);
+
+          state.mediaRecorder = recorder;
+          state.recordedChunks = [];
+          state.activeStream = stream;
+
+          recorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+              state.recordedChunks.push(event.data);
+            }
+          };
+
+          recorder.onstart = () => {
+            voiceBtn.classList.add("recording");
+            voiceBtn.textContent = "Стоп";
+            setStatus("listening_mic");
+          };
+
+          recorder.onerror = () => {
+            appendMessage("error", "Ошибка записи аудио");
+            setStatus("error");
+          };
+
+          recorder.onstop = async () => {
+            voiceBtn.classList.remove("recording");
+            voiceBtn.textContent = "Голос";
+
+            if (state.activeStream) {
+              state.activeStream.getTracks().forEach((t) => t.stop());
+              state.activeStream = null;
+            }
+
+            const blob = new Blob(state.recordedChunks, {
+              type: recorder.mimeType || "audio/webm",
+            });
+
+            state.mediaRecorder = null;
+            state.recordedChunks = [];
+
+            if (blob.size === 0) {
+              appendMessage("error", "Пустая аудиозапись");
+              setStatus("listening");
+              return;
+            }
+
+            try {
+              const base64Audio = await blobToBase64(blob);
+              state.ws.send(
+                JSON.stringify({
+                  type: "audio",
+                  payload: base64Audio,
+                })
+              );
+            } catch (err) {
+              appendMessage("error", `Не удалось отправить аудио: ${err.message || err}`);
+              setStatus("error");
+            }
+          };
+
+          recorder.start();
+        } catch (err) {
+          appendMessage("error", `Доступ к микрофону отклонен: ${err.message || err}`);
+          setStatus("error");
+        }
+      }
+
+      connectBtn.addEventListener("click", connect);
+      apiKeyInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          unlockAudio();
+          connect();
+        }
+      });
+
+      sendBtn.addEventListener("click", sendTextMessage);
+      voiceBtn.addEventListener("click", toggleVoiceRecording);
+      messageInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          unlockAudio();
+          sendTextMessage();
+        }
+      });
+
+      setStatus("offline");
+    </script>
+  </body>
+</html>

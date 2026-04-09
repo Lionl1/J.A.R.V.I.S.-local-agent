@@ -1,0 +1,40 @@
+# UV / Python virtual environments
+.venv/
+venv/
+
+# Python caches / tooling
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Local secrets / environment
+.env
+.env.*
+!.env.example
+
+# SQLite / local state
+*.db
+jarvis_memory.db
+
+# Temporary audio artifacts
+*.webm
+*.wav
+*.mp3
+
+# Runtime logs
+*.log
+
+
+mcp_config.json

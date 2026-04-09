@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jarvis_local"
+version = "0.1.0"
+description = "Local J.A.R.V.I.S. assistant (FastAPI + AsyncOpenAI + tools + MCP)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "websockets>=12.0",
+  "openai>=1.40.0",
+  "faster-whisper>=1.0.3",
+  "edge-tts>=6.1.12",
+  "mcp>=1.2.0",
+  "python-dotenv>=1.0.1",
+  "SpeechRecognition>=3.10.0",
+  "duckduckgo-search>=7.0.0",
+  "watchdog>=4.0.1",
+  "pyautogui>=0.9.54",
+  "Pillow>=10.4.0",
+  "PyAudio>=0.2.14",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jarvis_backend"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/jarvis_backend",
+  "static",
+  "README.md",
+  "jarvis_rules.md",
+  "mcp_config.json",
+]
