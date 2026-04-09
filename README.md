@@ -67,10 +67,3 @@ cp mcp_config.example.json mcp_config.json
 - `make dev` — FastAPI + autoreload для веб-интерфейса.
 - `make run` — CLI-режим ассистента (без веба).
 
-## Безопасность
-- Не коммитьте `.env`, токены и приватные пути.
-- Для публичного репозитория используйте только `.env.example` и `mcp_config.example.json`.
-- Если пробрасываете сервер наружу (ngrok/cloudflared), обязательно используйте API key.
-
-## Лицензия
-Добавьте вашу лицензию в `LICENSE` (например, MIT).
