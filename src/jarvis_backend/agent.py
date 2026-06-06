@@ -14,10 +14,11 @@ from .config import settings
 from .tools import execute_tool
 
 FALLBACK_SYSTEM_PROMPT = (
-    "Ты J.A.R.V.I.S. Локальный ассистент. "
-    "Отвечай кратко и вежливо. "
-    "Используй инструменты только при необходимости. "
-    "Финальные ответы формируй без markdown."
+    "You are J.A.R.V.I.S., a local AI assistant. "
+    "Respond concisely and politely. "
+    "Use tools only when necessary. "
+    "Do not use markdown in your final verbal replies. "
+    "Automatically detect the user's language and respond in the same language based on context."
 )
 
 
@@ -116,63 +117,6 @@ class AgentCore:
         # Fallback: if no turns were detected but still too large, keep tail.
         if len(self.messages) > max_messages:
             self.messages = [self.messages[0], *self.messages[-(max_messages - 1):]]
-
-    async def run_turn(self, user_text: str) -> dict[str, Any]:
-        self.messages.append({"role": "user", "content": user_text})
-
-        raw_output = await self._ask_llm(self.messages)
-        decision = self._parse_decision(raw_output)
-
-        result: dict[str, Any] = {
-            "thought": decision.thought,
-            "speech": decision.speech,
-            "action": None,
-            "observation": None,
-            "raw": decision.raw_text,
-        }
-
-        if decision.action:
-            observation = await execute_tool(decision.action.tool, decision.action.args)
-            result["action"] = {
-                "tool": decision.action.tool,
-                "args": decision.action.args,
-            }
-            result["observation"] = observation
-
-            # Keep tool result in history so the next turn has context.
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": json.dumps(
-                        {
-                            "thought": decision.thought,
-                            "action": {
-                                "tool": decision.action.tool,
-                                "args": decision.action.args,
-                            },
-                            "speech": decision.speech,
-                            "observation": observation,
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
-            )
-        else:
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": json.dumps(
-                        {
-                            "thought": decision.thought,
-                            "action": None,
-                            "speech": decision.speech,
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
-            )
-
-        return result
 
     async def _ask_llm(
         self,

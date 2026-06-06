@@ -159,32 +159,43 @@ async def on_shutdown() -> None:
     await mcp_manager.close()
 
 
+async def send_to_ws_safe(websocket: WebSocket | None, payload: dict[str, Any]) -> bool:
+    """Send JSON message to the given websocket or active_websocket safely under a lock."""
+    global active_websocket
+    target_ws = websocket or active_websocket
+    if target_ws is None:
+        return False
+    async with websocket_send_lock:
+        try:
+            await target_ws.send_json(payload)
+            return True
+        except Exception:
+            if active_websocket is target_ws:
+                active_websocket = None
+            return False
+
+
 async def _send_status(websocket: WebSocket, status: str) -> None:
-    await websocket.send_json({"type": "status", "payload": status})
+    await send_to_ws_safe(websocket, {"type": "status", "payload": status})
 
 
 async def trigger_proactive_message(message: str) -> None:
     """Send proactive speech_text/audio to currently active websocket."""
-    global active_websocket
-
     text = (message or "").strip()
     if not text or active_websocket is None:
         return
 
-    ws = active_websocket
+    ok = await send_to_ws_safe(None, {"type": "speech_text", "payload": text})
+    if not ok:
+        return
+
     try:
-        async with websocket_send_lock:
-            await ws.send_json({"type": "speech_text", "payload": text})
-            try:
-                audio_b64 = await synthesize_speech_base64(text)
-            except Exception:
-                audio_b64 = ""
-            if audio_b64:
-                await ws.send_json({"type": "audio", "payload": audio_b64})
+        audio_b64 = await synthesize_speech_base64(text)
     except Exception:
-        # Соединение уже закрыто/ошибка отправки — silently ignore.
-        if active_websocket is ws:
-            active_websocket = None
+        audio_b64 = ""
+
+    if audio_b64:
+        await send_to_ws_safe(None, {"type": "audio", "payload": audio_b64})
 
 
 async def _handle_trigger_prompt(prompt: str) -> None:
@@ -252,7 +263,28 @@ async def _run_agent_turn(user_text: str) -> str:
             tool_args = _parse_tool_arguments(function_payload.get("arguments"))
             tool_call_id = str(tool_call.get("id", "")).strip() or f"call_{_step}"
 
+            # Notify client that tool call started
+            await send_to_ws_safe(None, {
+                "type": "tool_call",
+                "payload": {
+                    "name": tool_name,
+                    "args": tool_args,
+                    "id": tool_call_id,
+                }
+            })
+
             observation_text = await _route_tool_call(tool_name, tool_args)
+
+            # Notify client that tool call finished
+            await send_to_ws_safe(None, {
+                "type": "tool_result",
+                "payload": {
+                    "name": tool_name,
+                    "result": observation_text,
+                    "id": tool_call_id,
+                }
+            })
+
             agent.messages.append(
                 {
                     "role": "tool",
@@ -278,7 +310,7 @@ async def _run_agent_turn(user_text: str) -> str:
     return fallback
 
 
-async def _handle_text_message(websocket: WebSocket, user_text: str) -> None:
+async def _handle_text_message(websocket: WebSocket, user_text: str | list[dict[str, Any]], voice: str) -> None:
     """Единый обработчик текстового запроса (из чата или из STT)."""
     await _send_status(websocket, "thinking")
 
@@ -286,24 +318,22 @@ async def _handle_text_message(websocket: WebSocket, user_text: str) -> None:
         async with agent_lock:
             final_speech = await _run_agent_turn(user_text)
     except Exception as exc:  # noqa: BLE001
-        await websocket.send_json(
-            {"type": "error", "payload": f"Agent error: {exc}"}
-        )
+        await send_to_ws_safe(websocket, {"type": "error", "payload": f"Agent error: {exc}"})
         await _send_status(websocket, "listening")
         return
 
-    await websocket.send_json({"type": "speech_text", "payload": final_speech})
+    await send_to_ws_safe(websocket, {"type": "speech_text", "payload": final_speech})
 
     await _send_status(websocket, "executing")
     try:
-        audio_b64 = await synthesize_speech_base64(final_speech)
+        audio_b64 = await synthesize_speech_base64(final_speech, voice=voice)
     except Exception as exc:  # noqa: BLE001
-        await websocket.send_json({"type": "error", "payload": f"TTS error: {exc}"})
+        await send_to_ws_safe(websocket, {"type": "error", "payload": f"TTS error: {exc}"})
         await _send_status(websocket, "listening")
         return
 
     if audio_b64:
-        await websocket.send_json({"type": "audio", "payload": audio_b64})
+        await send_to_ws_safe(websocket, {"type": "audio", "payload": audio_b64})
 
     await _send_status(websocket, "listening")
 
@@ -317,7 +347,16 @@ async def ws_jarvis(websocket: WebSocket) -> None:
     await websocket.accept()
     active_websocket = websocket
 
+    # Send tools list to client
+    try:
+        all_tools = TOOLS_SCHEMAS + await mcp_manager.get_all_tools()
+        await send_to_ws_safe(websocket, {"type": "tools_list", "payload": all_tools})
+    except Exception:
+        pass
+
     await _send_status(websocket, "listening")
+
+    client_voice = settings.tts_voice
 
     while True:
         try:
@@ -331,16 +370,59 @@ async def ws_jarvis(websocket: WebSocket) -> None:
         msg_type = message.get("type")
         payload = message.get("payload")
 
+        if msg_type == "set_voice":
+            client_voice = str(payload).strip()
+            continue
+
+        if msg_type == "get_mcp_config":
+            try:
+                config_path = mcp_manager.config_path
+                if config_path.exists():
+                    cfg_data = json.loads(config_path.read_text(encoding="utf-8"))
+                else:
+                    cfg_data = {"mcpServers": {}}
+                await send_to_ws_safe(websocket, {"type": "mcp_config", "payload": cfg_data})
+            except Exception as e:
+                await send_to_ws_safe(websocket, {"type": "error", "payload": f"Failed to get MCP config: {e}"})
+            continue
+
+        if msg_type == "update_mcp_config":
+            try:
+                mcp_manager.config_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+                await mcp_manager.close()
+                await mcp_manager.start()
+                all_tools = TOOLS_SCHEMAS + await mcp_manager.get_all_tools()
+                await send_to_ws_safe(websocket, {"type": "tools_list", "payload": all_tools})
+                await send_to_ws_safe(websocket, {"type": "status", "payload": "listening"})
+            except Exception as e:
+                await send_to_ws_safe(websocket, {"type": "error", "payload": f"Failed to update MCP config: {e}"})
+            continue
+
+        if msg_type == "image":
+            try:
+                image_b64 = payload.get("image_b64", "")
+                text_prompt = payload.get("text", "").strip() or "Analyze this image."
+                if not image_b64:
+                    raise ValueError("Empty image_b64 payload")
+
+                user_content = [
+                    {"type": "text", "text": text_prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+                ]
+                await send_to_ws_safe(websocket, {"type": "text", "payload": text_prompt})
+                await _handle_text_message(websocket, user_content, voice=client_voice)
+            except Exception as e:
+                await send_to_ws_safe(websocket, {"type": "error", "payload": f"Failed to process image: {e}"})
+            continue
+
         if msg_type == "text":
             user_text = (payload or "").strip()
             if not user_text:
-                await websocket.send_json(
-                    {"type": "error", "payload": "Empty text payload"}
-                )
+                await send_to_ws_safe(websocket, {"type": "error", "payload": "Empty text payload"})
                 await _send_status(websocket, "listening")
                 continue
 
-            await _handle_text_message(websocket, user_text)
+            await _handle_text_message(websocket, user_text, voice=client_voice)
             continue
 
         if msg_type == "audio":
@@ -352,36 +434,28 @@ async def ws_jarvis(websocket: WebSocket) -> None:
                 else:
                     raise ValueError("Payload must be base64 string")
             except Exception:  # noqa: BLE001
-                await websocket.send_json(
-                    {"type": "error", "payload": "Invalid base64 audio payload"}
-                )
+                await send_to_ws_safe(websocket, {"type": "error", "payload": "Invalid base64 audio payload"})
                 await _send_status(websocket, "listening")
                 continue
 
             try:
                 recognized_text = (await transcribe_audio_bytes(audio_bytes)).strip()
             except Exception as exc:  # noqa: BLE001
-                await websocket.send_json(
-                    {"type": "error", "payload": f"STT error: {exc}"}
-                )
+                await send_to_ws_safe(websocket, {"type": "error", "payload": f"STT error: {exc}"})
                 await _send_status(websocket, "listening")
                 continue
 
             if not recognized_text:
-                await websocket.send_json(
-                    {"type": "error", "payload": "Не удалось распознать речь"}
-                )
+                await send_to_ws_safe(websocket, {"type": "error", "payload": "Не удалось распознать речь"})
                 await _send_status(websocket, "listening")
                 continue
 
-            await websocket.send_json({"type": "text", "payload": recognized_text})
-            await _handle_text_message(websocket, recognized_text)
+            await send_to_ws_safe(websocket, {"type": "text", "payload": recognized_text})
+            await _handle_text_message(websocket, recognized_text, voice=client_voice)
             continue
 
-        await websocket.send_json(
-            {
-                "type": "error",
-                "payload": "Unsupported message type. Use 'text' or 'audio'.",
-            }
-        )
+        await send_to_ws_safe(websocket, {
+            "type": "error",
+            "payload": "Unsupported message type. Use 'text' or 'audio'.",
+        })
         await _send_status(websocket, "listening")
