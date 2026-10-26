@@ -111,6 +111,8 @@ class Settings:
     max_history_messages: int
 
     tts_voice: str
+    tts_engine: str
+    system_tts_voice: str | None
     stt_language: str
     whisper_model: str
     whisper_device: str
@@ -120,6 +122,13 @@ class Settings:
     trigger_watch_dir: str | None
     debug_text_mode: bool
     confirm_timeout: float
+
+    wake_word: bool
+    wake_engine: str
+    wake_threshold: float
+    wake_device: str | None
+    wake_model: str
+    voice_reply_local: bool
 
     state_dir: Path
     skills_dir: Path
@@ -174,6 +183,8 @@ class Settings:
             max_tool_steps=max(1, _env_int("JARVIS_MAX_TOOL_STEPS", 12)),
             max_history_messages=max(4, _env_int("JARVIS_MAX_HISTORY", 60)),
             tts_voice=_env_str("JARVIS_TTS_VOICE", "ru-RU-SvetlanaNeural"),
+            tts_engine=_env_str("JARVIS_TTS_ENGINE", "auto").lower(),
+            system_tts_voice=_env_optional_str("JARVIS_SYSTEM_TTS_VOICE"),
             stt_language=_env_str("JARVIS_STT_LANGUAGE", "ru"),
             whisper_model=_env_str("JARVIS_WHISPER_MODEL", "base"),
             whisper_device=_env_str("JARVIS_WHISPER_DEVICE", "auto"),
@@ -182,6 +193,12 @@ class Settings:
             trigger_watch_dir=_env_optional_str("JARVIS_TRIGGER_DIR"),
             debug_text_mode=_env_bool("JARVIS_DEBUG_TEXT_MODE", False),
             confirm_timeout=max(5.0, _env_float("JARVIS_CONFIRM_TIMEOUT", 120.0)),
+            wake_word=_env_bool("JARVIS_WAKE_WORD", False),
+            wake_engine=_env_str("JARVIS_WAKE_ENGINE", "whisper").lower(),
+            wake_threshold=_env_float("JARVIS_WAKE_THRESHOLD", 0.5),
+            wake_device=_env_optional_str("JARVIS_WAKE_DEVICE"),
+            wake_model=_env_str("JARVIS_WAKE_MODEL", "hey_jarvis"),
+            voice_reply_local=_env_bool("JARVIS_VOICE_REPLY_LOCAL", True),
             state_dir=project_root / ".jarvis",
             skills_dir=source_root / "skills",
             verify_changes=_env_bool("JARVIS_VERIFY_CHANGES", True),

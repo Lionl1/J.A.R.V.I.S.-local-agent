@@ -25,6 +25,20 @@ Set `JARVIS_PROVIDER` in `.env`:
 canonical format, so the brain can be swapped without losing context. With `anthropic`, server-side refusal
 fallbacks (`fallbacks: "default"`) are enabled for models that support them.
 
+## Background voice agent
+- **Voice activation**: set `JARVIS_WAKE_WORD=true` and just say «Джарвис, который час?» (or «Джарвис!», wait for
+  the chime, then the command). Speech is segmented and recognised locally with faster-whisper; phrases not addressed
+  to Jarvis are ignored. `JARVIS_WAKE_ENGINE=openwakeword` uses the lighter English "Hey Jarvis" model instead
+  (`uv sync --extra wakeword`). The microphone is ignored while Jarvis speaks.
+- **Replies** are spoken through the computer speakers and mirrored to the web UI if it is open. Reminders and
+  triggers are spoken aloud even when no browser is connected.
+- **Voice output**: edge-tts, with an automatic fallback to the offline system voice (macOS `say`, espeak-ng, SAPI)
+  when the Microsoft service fails.
+- **Autostart**: `make autostart-install` registers a LaunchAgent (macOS) or a systemd user unit (Linux) that starts
+  Jarvis at login and restarts it after a crash; logs go to `.jarvis/logs/jarvis.log`.
+  `make autostart-status`, `make autostart-uninstall`.
+- On macOS, allow microphone access for Python the first time (System Settings → Privacy & Security → Microphone).
+
 ## Self-improvement (RSI) loop
 1. Jarvis reads its files (`list_source_files`, `read_source_code`).
 2. It changes them with `edit_source_code` (exact fragment replacement) or `update_source_code` (new/whole file).
@@ -107,3 +121,4 @@ cp mcp_config.example.json mcp_config.json
 - `make run` — Launch J.A.R.V.I.S. in CLI console mode (without the Web UI).
 - `make rollback` — Revert the last agent-made code change (works even if the server no longer starts).
 - `make test` — Run the test suite.
+- `make autostart-install` / `autostart-status` / `autostart-uninstall` — Start Jarvis at login.

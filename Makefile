@@ -1,4 +1,4 @@
-.PHONY: sync dev start run rollback test
+.PHONY: sync dev start run rollback test autostart-install autostart-uninstall autostart-status
 
 sync:
 	uv sync
@@ -19,3 +19,13 @@ rollback:
 
 test:
 	uv run pytest -q
+
+# Автозапуск при входе в систему (macOS LaunchAgent / Linux systemd --user).
+autostart-install:
+	uv run python -m src.jarvis_backend.autostart install
+
+autostart-uninstall:
+	python3 -m src.jarvis_backend.autostart uninstall
+
+autostart-status:
+	python3 -m src.jarvis_backend.autostart status

@@ -18,11 +18,12 @@ from starlette.status import HTTP_401_UNAUTHORIZED
 
 from . import tools
 from .agent import AgentCore
-from .audio import synthesize_speech_base64, transcribe_audio_bytes
+from .audio import speak, synthesize_speech_base64, transcribe_audio_bytes
 from .brain import BrainError
 from .config import settings
 from .mcp_manager import MCPManager
 from .triggers import DirectoryWatcher
+from .wake import VoiceListener
 from .tools import (
     execute_tool,
     get_tool_schemas,
@@ -70,6 +71,7 @@ mcp_manager = MCPManager(on_tools_changed=_broadcast_tools)
 active_websocket: WebSocket | None = None
 websocket_send_lock: asyncio.Lock = asyncio.Lock()
 directory_watcher: DirectoryWatcher | None = None
+voice_listener: VoiceListener | None = None
 directory_watcher_task: asyncio.Task[Any] | None = None
 # Ожидающие ответа пользователя подтверждения: id -> (future, сокет, которому отправлен запрос).
 pending_confirmations: dict[str, tuple[asyncio.Future[bool], WebSocket]] = {}
@@ -178,6 +180,11 @@ async def on_startup() -> None:
     # MCP поднимается в фоне: npx/uvx могут качать пакеты десятки секунд.
     await mcp_manager.start()
 
+    global voice_listener
+    if settings.wake_word:
+        voice_listener = VoiceListener(_handle_voice_command, on_wake=_on_voice_wake)
+        await voice_listener.start()
+
     global directory_watcher, directory_watcher_task
     if TRIGGER_WATCH_DIR:
         directory_watcher = DirectoryWatcher(
@@ -194,6 +201,10 @@ async def on_shutdown() -> None:
     set_proactive_callback(None)
     set_confirmation_callback(None)
     set_rules_changed_callback(None)
+    global voice_listener
+    if voice_listener is not None:
+        await voice_listener.stop()
+        voice_listener = None
     _deny_pending_confirmations(None)
     global directory_watcher, directory_watcher_task
     if directory_watcher is not None:
@@ -228,14 +239,31 @@ async def _send_status(websocket: WebSocket, status: str) -> None:
     await send_to_ws_safe(websocket, {"type": "status", "payload": status})
 
 
+async def _speak_locally(text: str) -> None:
+    """Произнести через динамики компьютера (фоновый режим без открытого UI)."""
+    try:
+        if voice_listener is not None:
+            async with voice_listener.muted():
+                await speak(text)
+        else:
+            await speak(text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[VOICE] TTS error: {exc}", flush=True)
+
+
+def _reply_locally() -> bool:
+    return active_websocket is None or (voice_listener is not None and settings.voice_reply_local)
+
+
 async def trigger_proactive_message(message: str) -> None:
-    """Send proactive speech_text/audio to currently active websocket."""
+    """Проактивное сообщение (напоминание, триггер): в UI и/или голосом из динамиков."""
     text = (message or "").strip()
-    if not text or active_websocket is None:
+    if not text:
         return
 
-    ok = await send_to_ws_safe(None, {"type": "speech_text", "payload": text})
-    if not ok:
+    await send_to_ws_safe(None, {"type": "speech_text", "payload": text})
+    if _reply_locally():
+        await _speak_locally(text)
         return
 
     try:
@@ -355,6 +383,36 @@ def _schedule_restart_if_needed() -> None:
         os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
 
     _start_background_turn(_restart())
+
+
+async def _on_voice_wake() -> None:
+    await send_to_ws_safe(None, {"type": "status", "payload": "listening_mic"})
+
+
+async def _handle_voice_command(command: str) -> None:
+    """Команда, сказанная в микрофон компьютера («Джарвис, …»)."""
+    await send_to_ws_safe(None, {"type": "text", "payload": command})
+    await send_to_ws_safe(None, {"type": "status", "payload": "thinking"})
+    try:
+        async with agent_lock:
+            final_speech = await _run_agent_turn(command)
+    except Exception as exc:  # noqa: BLE001
+        final_speech = f"Ошибка агента: {exc}"
+    await send_to_ws_safe(None, {"type": "speech_text", "payload": final_speech})
+
+    if _reply_locally():
+        # Отвечаем из динамиков компьютера; микрофон в это время не слушаем.
+        await send_to_ws_safe(None, {"type": "status", "payload": "executing"})
+        await _speak_locally(final_speech)
+    else:
+        try:
+            audio_b64 = await synthesize_speech_base64(final_speech)
+        except Exception:  # noqa: BLE001
+            audio_b64 = ""
+        if audio_b64:
+            await send_to_ws_safe(None, {"type": "audio", "payload": audio_b64})
+    await send_to_ws_safe(None, {"type": "status", "payload": "listening"})
+    _schedule_restart_if_needed()
 
 
 async def _resume_interrupted_turn() -> None:

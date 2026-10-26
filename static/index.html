@@ -1610,7 +1610,9 @@
       function playBase64Audio(base64Payload) {
         return new Promise((resolve) => {
           initVisualizer();
-          globalAudio.src = `data:audio/mp3;base64,${base64Payload}`;
+          // Сервер шлёт MP3 (edge-tts) или WAV (системный голос ОС, base64 WAV начинается с "UklGR").
+          const mime = base64Payload.startsWith("UklGR") ? "audio/wav" : "audio/mpeg";
+          globalAudio.src = `data:${mime};base64,${base64Payload}`;
           
           const cleanup = () => {
             if (statusText.textContent === "speaking" || statusText.textContent === "executing") {

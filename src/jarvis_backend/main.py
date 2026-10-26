@@ -11,6 +11,7 @@ from .audio import listen, speak
 from .brain import BrainError
 from .config import settings
 from .mcp_manager import MCPManager
+from .wake import VoiceListener
 
 # Режим отладки: True -> только текстовый ввод/вывод без микрофона и TTS.
 DEBUG_TEXT_MODE = settings.debug_text_mode
@@ -28,11 +29,19 @@ async def _confirm_in_terminal(tool_name: str, args: dict, details: dict) -> boo
     return answer.strip().lower() in {"y", "yes", "д", "да"}
 
 
+# Фоновое прослушивание «Джарвис, …» (JARVIS_WAKE_WORD=true) вместо реакции на любую фразу.
+_voice_listener: VoiceListener | None = None
+_voice_commands: asyncio.Queue[str] = asyncio.Queue()
+
+
 async def _read_user_command() -> str:
     """Получает команду пользователя в debug или voice-режиме."""
     if DEBUG_TEXT_MODE:
         # input() блокирующий, поэтому выносим в thread через to_thread.
         return (await asyncio.to_thread(input, "Вы> ")).strip()
+
+    if _voice_listener is not None:
+        return (await _voice_commands.get()).strip()
 
     try:
         return (await listen()).strip()
@@ -51,8 +60,13 @@ async def _deliver_speech(text: str) -> None:
         print(f"JARVIS> {normalized}")
         return
 
+    print(f"JARVIS> {normalized}")
     try:
-        await speak(normalized)
+        if _voice_listener is not None:
+            async with _voice_listener.muted():
+                await speak(normalized)
+        else:
+            await speak(normalized)
     except Exception as exc:  # noqa: BLE001
         print(f"[TTS ERROR] {exc}")
 
@@ -96,6 +110,12 @@ async def main() -> None:
     tools.set_proactive_callback(_deliver_speech)
     await mcp_manager.start()
 
+    global _voice_listener
+    if settings.wake_word and not DEBUG_TEXT_MODE:
+        _voice_listener = VoiceListener(_voice_commands.put)
+        await _voice_listener.start()
+        print("Скажите «Джарвис, …»")
+
     try:
         if agent.has_interrupted_turn():
             await _deliver_speech(await agent.resume_turn(on_event=_print_tool_event))
@@ -127,9 +147,13 @@ async def main() -> None:
             await _deliver_speech(final_speech)
 
             if tools.restart_required:
+                if _voice_listener is not None:
+                    await _voice_listener.stop()
                 await mcp_manager.close()
                 _restart_process()
     finally:
+        if _voice_listener is not None:
+            await _voice_listener.stop()
         await mcp_manager.close()
 
 
