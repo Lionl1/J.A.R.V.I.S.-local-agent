@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +17,28 @@ except Exception:  # noqa: BLE001
     ClientSession = None  # type: ignore[assignment]
     StdioServerParameters = None  # type: ignore[assignment]
     stdio_client = None  # type: ignore[assignment]
+
+
+# Фоновый агент (launchd, systemd, IDE) часто стартует с урезанным PATH,
+# где нет npx/uvx — ищем их и в стандартных местах установки.
+_EXTRA_BIN_DIRS = (
+    Path.home() / ".local" / "bin",
+    Path.home() / ".cargo" / "bin",
+    Path("/opt/homebrew/bin"),
+    Path("/usr/local/bin"),
+)
+
+
+def _resolve_command(command: str) -> str:
+    if os.sep in command or shutil.which(command):
+        return command
+    for directory in _EXTRA_BIN_DIRS:
+        candidate = directory / command
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    raise FileNotFoundError(
+        f"команда '{command}' не найдена ни в PATH, ни в {', '.join(map(str, _EXTRA_BIN_DIRS))}"
+    )
 
 
 @dataclass(slots=True)
@@ -78,7 +102,7 @@ class MCPManager:
                 await self._refresh_tools()
                 self._ready.set()
                 if self._sessions:
-                    print(f"[MCP] ready: {', '.join(self._sessions)} ({len(self._tools_cache)} tools)")
+                    print(f"[MCP] ready: {', '.join(self._sessions)} ({len(self._tools_cache)} tools)", flush=True)
                 if self.on_tools_changed is not None:
                     try:
                         await self.on_tools_changed()
@@ -86,7 +110,7 @@ class MCPManager:
                         pass
                 await self._stop.wait()
         except Exception as exc:  # noqa: BLE001
-            print(f"[MCP] manager crashed: {exc}")
+            print(f"[MCP] manager crashed: {exc}", flush=True)
         finally:
             self._sessions.clear()
             self._tool_map.clear()
@@ -97,7 +121,13 @@ class MCPManager:
         """Подключить один сервер; его падение не мешает остальным."""
         server_stack = AsyncExitStack()
         try:
-            params = StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env or None)
+            command = _resolve_command(cfg.command)
+            env = dict(cfg.env)
+            bin_dir = os.path.dirname(command)
+            if bin_dir:
+                # npx/uvx сами запускают node/python через PATH — добавляем их папку.
+                env["PATH"] = os.pathsep.join([bin_dir, env.get("PATH") or os.environ.get("PATH", "")])
+            params = StdioServerParameters(command=command, args=cfg.args, env=env or None)
             read_stream, write_stream = await server_stack.enter_async_context(stdio_client(params))
             session = await server_stack.enter_async_context(ClientSession(read_stream, write_stream))
             await asyncio.wait_for(session.initialize(), timeout=self.INIT_TIMEOUT)
@@ -106,7 +136,7 @@ class MCPManager:
                 await server_stack.aclose()
                 raise
             self.errors[server_name] = f"{type(exc).__name__}: {exc}"
-            print(f"[MCP] server '{server_name}' failed to start: {self.errors[server_name]}")
+            print(f"[MCP] server '{server_name}' failed to start: {self.errors[server_name]}", flush=True)
             try:
                 await server_stack.aclose()
             except BaseException:  # noqa: BLE001

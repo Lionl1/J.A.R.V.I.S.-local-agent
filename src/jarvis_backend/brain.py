@@ -18,6 +18,9 @@ from typing import Any
 from .config import Settings, settings
 
 
+CONNECT_TIMEOUT = 5.0
+
+
 class BrainError(RuntimeError):
     """LLM недоступна или вернула ошибку; текст пригоден для показа пользователю."""
 
@@ -74,13 +77,14 @@ class OpenAICompatBrain(Brain):
 
     def __init__(self, cfg: Settings) -> None:
         super().__init__(cfg)
-        from openai import AsyncOpenAI
+        from openai import AsyncOpenAI, Timeout
 
         self.provider = cfg.provider
         self.client = AsyncOpenAI(
             base_url=cfg.base_url,
             api_key=cfg.api_key or "local-key",
-            timeout=cfg.llm_timeout,
+            # Короткий connect: недоступный сервер, молча роняющий пакеты, не должен держать UI минуту.
+            timeout=Timeout(cfg.llm_timeout, connect=CONNECT_TIMEOUT),
             # По умолчанию SDK делает 2 повтора — при мёртвом сервере UI висел ~90 секунд.
             max_retries=cfg.llm_max_retries,
         )
@@ -175,7 +179,7 @@ class AnthropicBrain(Brain):
         self.client = anthropic.AsyncAnthropic(
             api_key=key,
             base_url=cfg.base_url,
-            timeout=max(cfg.llm_timeout, 120.0),
+            timeout=anthropic.Timeout(max(cfg.llm_timeout, 120.0), connect=CONNECT_TIMEOUT),
             max_retries=cfg.llm_max_retries,
         )
         self._anthropic = anthropic

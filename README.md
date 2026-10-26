@@ -97,6 +97,7 @@ cp mcp_config.example.json mcp_config.json
 ```
 2. Replace `<INSERT_YOUR_PATH_HERE>` with your actual directories.
 3. For the `sqlite` server, pass the database file path via the `--db-path` argument, otherwise the server will fail to start.
+   Keep `"--with", "mcp<2"` in its `args`: `mcp-server-sqlite` is unmaintained and crashes with `mcp` 2.x.
 4. Restart your FastAPI server.
 
 ## Useful Commands

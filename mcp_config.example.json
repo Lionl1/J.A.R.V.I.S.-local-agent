@@ -24,6 +24,8 @@
     "sqlite": {
       "command": "uvx",
       "args": [
+        "--with",
+        "mcp<2",
         "mcp-server-sqlite",
         "--db-path",
         "<INSERT_YOUR_PATH_HERE>/jarvis_memory.db"
