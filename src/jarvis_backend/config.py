@@ -98,6 +98,7 @@ class Settings:
     hf_token: str | None
     trigger_watch_dir: str | None
     debug_text_mode: bool
+    confirm_timeout: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -136,6 +137,7 @@ class Settings:
             hf_token=_env_optional_str("HF_TOKEN"),
             trigger_watch_dir=_env_optional_str("JARVIS_TRIGGER_DIR"),
             debug_text_mode=_env_bool("JARVIS_DEBUG_TEXT_MODE", False),
+            confirm_timeout=max(5.0, _env_float("JARVIS_CONFIRM_TIMEOUT", 120.0)),
         )
 
         # Совместимость для huggingface_hub.

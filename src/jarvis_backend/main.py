@@ -6,12 +6,23 @@ import json
 from .agent import AgentCore
 from .audio import listen, speak
 from .config import settings
-from .tools import execute_tool
+from .tools import execute_tool, set_confirmation_callback
 
 # Режим отладки: True -> только текстовый ввод/вывод без микрофона и TTS.
 DEBUG_TEXT_MODE = settings.debug_text_mode
 
 MAX_TOOL_STEPS = settings.max_tool_steps
+
+
+async def _confirm_in_terminal(tool_name: str, args: dict, details: dict) -> bool:
+    """Подтверждение опасного инструмента в консоли (и в voice-режиме тоже — голосом не разрешаем)."""
+    print(f"\n[ПОДТВЕРЖДЕНИЕ] {details.get('summary', tool_name)}")
+    if details.get("diff"):
+        print(details["diff"])
+    if details.get("files"):
+        print("Файлы: " + ", ".join(details["files"]))
+    answer = await asyncio.to_thread(input, "Разрешить? [y/N] ")
+    return answer.strip().lower() in {"y", "yes", "д", "да"}
 
 
 async def _read_user_command() -> str:
@@ -139,6 +150,7 @@ async def main() -> None:
     """Точка входа в бесконечный Agentic Loop."""
     # Конфиг агента берётся из env внутри AgentCore.
     agent = AgentCore()
+    set_confirmation_callback(_confirm_in_terminal)
 
     while True:
         print("Ожидание команды...")

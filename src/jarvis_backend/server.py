@@ -18,13 +18,20 @@ from .audio import synthesize_speech_base64, transcribe_audio_bytes
 from .config import settings
 from .mcp_manager import MCPManager
 from .triggers import DirectoryWatcher
-from .tools import LOCAL_TOOL_NAMES, TOOLS_SCHEMAS, execute_tool, set_proactive_callback
+from .tools import (
+    LOCAL_TOOL_NAMES,
+    TOOLS_SCHEMAS,
+    execute_tool,
+    set_confirmation_callback,
+    set_proactive_callback,
+)
 
 API_KEY = settings.api_key.strip()
 MODEL_NAME = settings.model
 BASE_URL = settings.base_url
 MAX_TOOL_STEPS = settings.max_tool_steps
 TRIGGER_WATCH_DIR = (settings.trigger_watch_dir or "").strip()
+CONFIRM_TIMEOUT = settings.confirm_timeout
 
 if not API_KEY:
     raise RuntimeError(
@@ -42,6 +49,10 @@ active_websocket: WebSocket | None = None
 websocket_send_lock: asyncio.Lock = asyncio.Lock()
 directory_watcher: DirectoryWatcher | None = None
 directory_watcher_task: asyncio.Task[Any] | None = None
+# Ожидающие ответа пользователя подтверждения: id -> (future, сокет, которому отправлен запрос).
+pending_confirmations: dict[str, tuple[asyncio.Future[bool], WebSocket]] = {}
+# Turn'ы агента выполняются фоном, чтобы цикл приёма мог получить ответ на подтверждение.
+background_turns: set[asyncio.Task[Any]] = set()
 
 app = FastAPI(title="J.A.R.V.I.S. Local Server", version="1.0.0")
 app.add_middleware(
@@ -129,6 +140,7 @@ async def health() -> dict[str, str]:
 @app.on_event("startup")
 async def on_startup() -> None:
     set_proactive_callback(trigger_proactive_message)
+    set_confirmation_callback(request_confirmation)
     await mcp_manager.start()
 
     global directory_watcher, directory_watcher_task
@@ -146,6 +158,8 @@ async def on_startup() -> None:
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     set_proactive_callback(None)
+    set_confirmation_callback(None)
+    _deny_pending_confirmations(None)
     global directory_watcher, directory_watcher_task
     if directory_watcher is not None:
         await directory_watcher.stop()
@@ -196,6 +210,72 @@ async def trigger_proactive_message(message: str) -> None:
 
     if audio_b64:
         await send_to_ws_safe(None, {"type": "audio", "payload": audio_b64})
+
+
+async def request_confirmation(
+    tool_name: str,
+    args: dict[str, Any],
+    details: dict[str, Any],
+) -> bool:
+    """Ask the connected user to approve a sensitive tool call; deny on timeout/disconnect."""
+    target_ws = active_websocket
+    if target_ws is None:
+        return False
+
+    confirmation_id = secrets.token_urlsafe(12)
+    future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    pending_confirmations[confirmation_id] = (future, target_ws)
+
+    # new_content не отправляем целиком: пользователь видит diff из details.
+    visible_args = {k: v for k, v in args.items() if k != "new_content"}
+    sent = await send_to_ws_safe(target_ws, {
+        "type": "confirm_request",
+        "payload": {
+            "id": confirmation_id,
+            "tool": tool_name,
+            "args": visible_args,
+            "timeout": CONFIRM_TIMEOUT,
+            **details,
+        },
+    })
+    try:
+        if not sent:
+            return False
+        return await asyncio.wait_for(future, timeout=CONFIRM_TIMEOUT)
+    except asyncio.TimeoutError:
+        await send_to_ws_safe(target_ws, {
+            "type": "confirm_closed",
+            "payload": {"id": confirmation_id, "reason": "timeout"},
+        })
+        return False
+    finally:
+        pending_confirmations.pop(confirmation_id, None)
+
+
+def _resolve_confirmation(websocket: WebSocket, payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    entry = pending_confirmations.get(str(payload.get("id", "")))
+    if entry is None:
+        return
+    future, target_ws = entry
+    # Ответ принимается только от того сокета, которому был отправлен запрос.
+    if target_ws is not websocket or future.done():
+        return
+    future.set_result(payload.get("approved") is True)
+
+
+def _deny_pending_confirmations(websocket: WebSocket | None) -> None:
+    """Deny confirmations of a closed socket (or all of them when websocket is None)."""
+    for future, target_ws in list(pending_confirmations.values()):
+        if (websocket is None or target_ws is websocket) and not future.done():
+            future.set_result(False)
+
+
+def _start_background_turn(coro: Any) -> None:
+    task = asyncio.create_task(coro, name="jarvis_turn")
+    background_turns.add(task)
+    task.add_done_callback(background_turns.discard)
 
 
 async def _handle_trigger_prompt(prompt: str) -> None:
@@ -362,13 +442,21 @@ async def ws_jarvis(websocket: WebSocket) -> None:
         try:
             message = await websocket.receive_json()
         except Exception:  # noqa: BLE001
-            await websocket.close()
+            _deny_pending_confirmations(websocket)
+            try:
+                await websocket.close()
+            except Exception:  # noqa: BLE001
+                pass
             if active_websocket is websocket:
                 active_websocket = None
             return
 
         msg_type = message.get("type")
         payload = message.get("payload")
+
+        if msg_type == "confirm_response":
+            _resolve_confirmation(websocket, payload)
+            continue
 
         if msg_type == "set_voice":
             client_voice = str(payload).strip()
@@ -410,7 +498,9 @@ async def ws_jarvis(websocket: WebSocket) -> None:
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
                 ]
                 await send_to_ws_safe(websocket, {"type": "text", "payload": text_prompt})
-                await _handle_text_message(websocket, user_content, voice=client_voice)
+                _start_background_turn(
+                    _handle_text_message(websocket, user_content, voice=client_voice)
+                )
             except Exception as e:
                 await send_to_ws_safe(websocket, {"type": "error", "payload": f"Failed to process image: {e}"})
             continue
@@ -422,7 +512,7 @@ async def ws_jarvis(websocket: WebSocket) -> None:
                 await _send_status(websocket, "listening")
                 continue
 
-            await _handle_text_message(websocket, user_text, voice=client_voice)
+            _start_background_turn(_handle_text_message(websocket, user_text, voice=client_voice))
             continue
 
         if msg_type == "audio":
@@ -451,7 +541,9 @@ async def ws_jarvis(websocket: WebSocket) -> None:
                 continue
 
             await send_to_ws_safe(websocket, {"type": "text", "payload": recognized_text})
-            await _handle_text_message(websocket, recognized_text, voice=client_voice)
+            _start_background_turn(
+                _handle_text_message(websocket, recognized_text, voice=client_voice)
+            )
             continue
 
         await send_to_ws_safe(websocket, {

@@ -36,3 +36,7 @@ include = [
   "jarvis_rules.md",
   "mcp_config.json",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

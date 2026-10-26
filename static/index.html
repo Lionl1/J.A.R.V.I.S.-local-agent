@@ -998,6 +998,53 @@
         gap: 10px;
       }
 
+      /* Confirmation dialog for sensitive tools */
+      .confirm-card {
+        width: min(860px, 100%);
+        max-height: calc(100vh - 40px);
+        border-color: rgba(245, 158, 11, 0.55);
+      }
+
+      .confirm-summary {
+        font-size: 14px;
+        color: var(--text);
+        line-height: 1.5;
+      }
+
+      .confirm-meta {
+        font-size: 12px;
+        color: var(--muted);
+        font-family: "Fira Code", monospace;
+        word-break: break-all;
+      }
+
+      .confirm-diff {
+        flex: 1;
+        min-height: 0;
+        max-height: 50vh;
+        overflow: auto;
+        margin: 0;
+        background: rgba(3, 7, 18, 0.75);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px;
+        font-family: "Fira Code", monospace;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--text);
+        white-space: pre;
+      }
+
+      .confirm-diff .diff-add { color: #4ade80; }
+      .confirm-diff .diff-del { color: #f87171; }
+      .confirm-diff .diff-hunk { color: #22d3ee; }
+
+      .btn-danger {
+        background: transparent;
+        border: 1px solid rgba(248, 113, 113, 0.6);
+        color: #f87171;
+      }
+
       /* Responsive Styling */
       @media (max-width: 960px) {
         body {
@@ -1196,6 +1243,23 @@
         </div>
       </section>
 
+      <!-- Confirmation dialog for sensitive tool calls -->
+      <section id="confirmModal" class="modal-overlay" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <div class="modal-card confirm-card">
+          <div class="modal-header">
+            <h2 id="confirmTitle" class="modal-title">Агент просит подтверждения</h2>
+            <span id="confirmCountdown" class="confirm-meta"></span>
+          </div>
+          <p id="confirmSummary" class="confirm-summary"></p>
+          <p id="confirmMeta" class="confirm-meta"></p>
+          <pre id="confirmDiff" class="confirm-diff"></pre>
+          <div class="modal-footer">
+            <button id="confirmDenyBtn" class="btn-danger">Отклонить</button>
+            <button id="confirmApproveBtn" class="btn-primary">Разрешить</button>
+          </div>
+        </div>
+      </section>
+
     </main>
 
     <!-- Global Application Scripts -->
@@ -1261,6 +1325,15 @@
       // Voice setting UI nodes
       const voiceSelect = document.getElementById("voiceSelect");
       const vadToggle = document.getElementById("vadToggle");
+
+      // Confirmation dialog nodes
+      const confirmModal = document.getElementById("confirmModal");
+      const confirmSummary = document.getElementById("confirmSummary");
+      const confirmMeta = document.getElementById("confirmMeta");
+      const confirmDiff = document.getElementById("confirmDiff");
+      const confirmCountdown = document.getElementById("confirmCountdown");
+      const confirmApproveBtn = document.getElementById("confirmApproveBtn");
+      const confirmDenyBtn = document.getElementById("confirmDenyBtn");
 
       // Modal nodes
       const mcpSettingsBtn = document.getElementById("mcpSettingsBtn");
@@ -1346,6 +1419,99 @@
         return body;
       }
 
+      // Tool args/results come from the web, screen and MCP servers: never inject them as HTML.
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      // Sensitive tool confirmations (one dialog at a time, others wait in queue)
+      const confirmQueue = [];
+      let activeConfirm = null;
+      let confirmTimer = null;
+
+      function renderDiff(diffText) {
+        confirmDiff.textContent = "";
+        String(diffText || "").split("\n").forEach((line) => {
+          const span = document.createElement("span");
+          if (line.startsWith("+") && !line.startsWith("+++")) span.className = "diff-add";
+          else if (line.startsWith("-") && !line.startsWith("---")) span.className = "diff-del";
+          else if (line.startsWith("@@")) span.className = "diff-hunk";
+          span.textContent = line + "\n";
+          confirmDiff.appendChild(span);
+        });
+      }
+
+      function showNextConfirm() {
+        if (activeConfirm || confirmQueue.length === 0) return;
+        activeConfirm = confirmQueue.shift();
+        const req = activeConfirm;
+
+        confirmSummary.textContent = req.summary || `Выполнить ${req.tool}`;
+        const metaParts = [`Инструмент: ${req.tool}`];
+        if (Array.isArray(req.files) && req.files.length) metaParts.push(`Файлы: ${req.files.join(", ")}`);
+        const visibleArgs = req.args && Object.keys(req.args).length ? JSON.stringify(req.args) : "";
+        if (visibleArgs) metaParts.push(`Параметры: ${visibleArgs}`);
+        confirmMeta.textContent = metaParts.join(" · ");
+
+        if (req.diff) {
+          renderDiff(req.diff);
+          confirmDiff.style.display = "block";
+        } else {
+          confirmDiff.textContent = "";
+          confirmDiff.style.display = "none";
+        }
+
+        const deadline = Date.now() + (Number(req.timeout) || 120) * 1000;
+        const tick = () => {
+          const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+          confirmCountdown.textContent = `автоотказ через ${left} с`;
+          if (left === 0) closeConfirm(req.id);
+        };
+        tick();
+        confirmTimer = setInterval(tick, 1000);
+
+        confirmModal.classList.add("active");
+        // Фокус на "Отклонить": случайный Enter не должен разрешать действие.
+        confirmDenyBtn.focus();
+      }
+
+      function closeConfirm(id) {
+        const idx = confirmQueue.findIndex((r) => r.id === id);
+        if (idx !== -1) confirmQueue.splice(idx, 1);
+        if (!activeConfirm || activeConfirm.id !== id) return;
+        clearInterval(confirmTimer);
+        confirmTimer = null;
+        activeConfirm = null;
+        confirmModal.classList.remove("active");
+        showNextConfirm();
+      }
+
+      function answerConfirm(approved) {
+        if (!activeConfirm) return;
+        const req = activeConfirm;
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+          state.ws.send(JSON.stringify({
+            type: "confirm_response",
+            payload: { id: req.id, approved: approved === true }
+          }));
+        }
+        appendMessage(
+          approved ? "jarvis" : "error",
+          `${approved ? "Разрешено" : "Отклонено"}: ${req.summary || req.tool}`
+        );
+        closeConfirm(req.id);
+      }
+
+      function resetConfirms() {
+        confirmQueue.length = 0;
+        if (activeConfirm) closeConfirm(activeConfirm.id);
+      }
+
       function saveMessageToHistory(msgObj) {
         state.chatHistory.push(msgObj);
         localStorage.setItem("jarvis_chat_history", JSON.stringify(state.chatHistory));
@@ -1367,9 +1533,9 @@
               item.innerHTML = `
                 <div class="tool-header">
                   <span class="tool-icon-spin"><i data-lucide="${msg.completed ? 'check-circle' : 'loader-2'}" class="${msg.completed ? 'text-ok' : 'spin'}"></i></span>
-                  <span class="tool-name">Инструмент: ${msg.name}</span>
+                  <span class="tool-name">Инструмент: ${escapeHtml(msg.name)}</span>
                 </div>
-                <div class="tool-args-preview">Параметры: <code>${JSON.stringify(msg.args)}</code></div>
+                <div class="tool-args-preview">Параметры: <code>${escapeHtml(JSON.stringify(msg.args))}</code></div>
               `;
               
               if (msg.completed && msg.result) {
@@ -1378,7 +1544,7 @@
                 resultDiv.innerHTML = `
                   <details>
                     <summary>Показать результат выполнения</summary>
-                    <pre><code>${msg.result}</code></pre>
+                    <pre><code>${escapeHtml(msg.result)}</code></pre>
                   </details>
                 `;
                 item.appendChild(resultDiv);
@@ -1518,10 +1684,10 @@
           card.className = "skill-card";
           card.innerHTML = `
             <div class="skill-top">
-              <span class="skill-name">${displayName}</span>
+              <span class="skill-name">${escapeHtml(displayName)}</span>
               <span class="skill-tag ${scope.toLowerCase()}">${scope}</span>
             </div>
-            <div class="skill-desc">${desc.slice(0, 80)}${desc.length > 80 ? '...' : ''}</div>
+            <div class="skill-desc">${escapeHtml(desc.slice(0, 80))}${desc.length > 80 ? '...' : ''}</div>
           `;
           skillsList.appendChild(card);
         });
@@ -1580,9 +1746,9 @@
           item.innerHTML = `
             <div class="tool-header">
               <span class="tool-icon-spin"><i data-lucide="loader-2" class="spin"></i></span>
-              <span class="tool-name">Инструмент: ${payload.name}</span>
+              <span class="tool-name">Инструмент: ${escapeHtml(payload.name)}</span>
             </div>
-            <div class="tool-args-preview">Параметры: <code>${JSON.stringify(payload.args)}</code></div>
+            <div class="tool-args-preview">Параметры: <code>${escapeHtml(JSON.stringify(payload.args))}</code></div>
           `;
           chatLog.appendChild(item);
           lucide.createIcons();
@@ -1618,7 +1784,7 @@
             resultDiv.innerHTML = `
               <details>
                 <summary>Показать результат выполнения</summary>
-                <pre><code>${rawText}</code></pre>
+                <pre><code>${escapeHtml(rawText)}</code></pre>
               </details>
             `;
             el.appendChild(resultDiv);
@@ -1634,6 +1800,24 @@
           }
           
           chatLog.scrollTop = chatLog.scrollHeight;
+          return;
+        }
+
+        if (type === "confirm_request") {
+          if (payload && payload.id) {
+            confirmQueue.push(payload);
+            showNextConfirm();
+          }
+          return;
+        }
+
+        if (type === "confirm_closed") {
+          if (payload && payload.id) {
+            if (activeConfirm && activeConfirm.id === payload.id) {
+              appendMessage("error", `Время на подтверждение истекло: ${activeConfirm.summary || activeConfirm.tool}`);
+            }
+            closeConfirm(payload.id);
+          }
           return;
         }
 
@@ -1679,7 +1863,9 @@
 
         ws.onclose = (event) => {
           state.ws = null;
-          
+          // Сервер сам отклоняет подтверждения закрытого сокета.
+          resetConfirms();
+
           globalAudio.pause();
           globalAudio.src = "";
           state.audioQueue = Promise.resolve();
@@ -2175,6 +2361,12 @@
 
       closeModalBtn.addEventListener("click", closeModal);
       cancelModalBtn.addEventListener("click", closeModal);
+
+      confirmApproveBtn.addEventListener("click", () => answerConfirm(true));
+      confirmDenyBtn.addEventListener("click", () => answerConfirm(false));
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && activeConfirm) answerConfirm(false);
+      });
 
       saveMcpBtn.addEventListener("click", () => {
         const rawJson = mcpConfigTextarea.value.trim();

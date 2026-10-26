@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as dt
+import difflib
 import io
 import json
 import platform
@@ -12,6 +13,7 @@ from typing import Any, Awaitable, Callable
 
 from duckduckgo_search import DDGS
 from openai import AsyncOpenAI
+from . import git_guard
 from .config import settings
 
 try:
@@ -29,11 +31,34 @@ SOURCE_ROOT = settings.source_root
 _proactive_callback: Callable[[str], Awaitable[None]] | None = None
 _reminder_tasks: set[asyncio.Task[Any]] = set()
 
+# Инструменты, которые выполняются только после явного "да" пользователя.
+# Аргументы для них может подсунуть prompt injection (web_search, экран, MCP, триггеры),
+# поэтому решение принимает человек, а не модель.
+CONFIRMATION_REQUIRED_TOOLS = {
+    "open_application",
+    "update_source_code",
+    "rollback_source_change",
+}
+MAX_DIFF_CHARS = 20000
+
+ConfirmationCallback = Callable[[str, dict[str, Any], dict[str, Any]], Awaitable[bool]]
+_confirmation_callback: ConfirmationCallback | None = None
+
 
 def set_proactive_callback(callback: Callable[[str], Awaitable[None]] | None) -> None:
     """Register callback used by background reminder tasks to push proactive messages."""
     global _proactive_callback
     _proactive_callback = callback
+
+
+def set_confirmation_callback(callback: ConfirmationCallback | None) -> None:
+    """Register callback that asks the user to approve a sensitive tool call.
+
+    Called as callback(tool_name, args, details) and must return True only on explicit approval.
+    Without a callback sensitive tools are always denied (fail closed).
+    """
+    global _confirmation_callback
+    _confirmation_callback = callback
 
 
 def _resolve_source_path(file_name: str) -> Path:
@@ -236,8 +261,8 @@ async def read_source_code(file_name: str) -> str:
     return await asyncio.to_thread(_read_blocking)
 
 
-async def update_source_code(file_name: str, new_content: str) -> str:
-    """Update .py/.md file; validate Python syntax for .py before save."""
+def _prepare_source_update(file_name: str, new_content: Any) -> tuple[Path, str]:
+    """Validate an update before asking the user: path sandbox, syntax, git state."""
     path = _resolve_source_path(file_name)
     content = new_content if isinstance(new_content, str) else str(new_content)
 
@@ -247,14 +272,97 @@ async def update_source_code(file_name: str, new_content: str) -> str:
         except (SyntaxError, IndentationError) as exc:
             line = getattr(exc, "lineno", "?")
             text = getattr(exc, "msg", str(exc))
-            return f"Ошибка синтаксиса: {text}. Строка: {line}. Файл НЕ обновлен."
+            raise ToolExecutionError(
+                f"Ошибка синтаксиса: {text}. Строка: {line}. Файл НЕ обновлен."
+            ) from exc
 
-    def _write_blocking() -> None:
+    git_guard.ensure_repo(PROJECT_ROOT)
+    git_guard.ensure_file_clean(PROJECT_ROOT, path)
+    return path, content
+
+
+def _source_diff(path: Path, content: str) -> str:
+    old = path.read_text(encoding="utf-8") if path.exists() else ""
+    rel = path.relative_to(PROJECT_ROOT).as_posix()
+    diff = "".join(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            content.splitlines(keepends=True),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+        )
+    )
+    if len(diff) > MAX_DIFF_CHARS:
+        diff = diff[:MAX_DIFF_CHARS] + "\n... (diff обрезан)"
+    return diff or "(изменений нет)"
+
+
+async def update_source_code(file_name: str, new_content: str) -> dict[str, Any]:
+    """Update .py/.md file: syntax check, git snapshot commit, then write to disk."""
+    path, content = _prepare_source_update(file_name, new_content)
+    rel = path.relative_to(PROJECT_ROOT).as_posix()
+
+    def _commit_and_write_blocking() -> str:
+        # Порядок важен: --reload перезапустит сервер сразу после записи файла,
+        # поэтому коммит и индекс должны быть готовы до неё.
+        sha = git_guard.commit_file(PROJECT_ROOT, path, content, f"update {rel}")
+        git_guard.sync_index_with_head(PROJECT_ROOT, path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        return sha
 
-    await asyncio.to_thread(_write_blocking)
-    return "Код успешно обновлен. Сервер сейчас будет перезагружен."
+    sha = await asyncio.to_thread(_commit_and_write_blocking)
+    return {
+        "ok": True,
+        "tool": "update_source_code",
+        "result": (
+            f"Код обновлен и закоммичен ({sha[:8]}). Сервер сейчас будет перезагружен. "
+            "Откат: инструмент rollback_source_change или `make rollback`."
+        ),
+        "commit": sha,
+    }
+
+
+async def rollback_source_change() -> dict[str, Any]:
+    """Revert the latest agent commit (only if HEAD was made by the agent)."""
+    info = await asyncio.to_thread(git_guard.revert_last_agent_commit, PROJECT_ROOT)
+    return {
+        "ok": True,
+        "tool": "rollback_source_change",
+        "result": (
+            f"Откачен коммит {info.sha[:8]} «{info.subject}» "
+            f"({', '.join(info.files)}). Сервер будет перезагружен."
+        ),
+    }
+
+
+def describe_tool_call(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Human-readable details for a confirmation prompt; raises if the call is invalid."""
+    if tool_name == "update_source_code":
+        path, content = _prepare_source_update(
+            args.get("file_name", ""), args.get("new_content", "")
+        )
+        rel = path.relative_to(PROJECT_ROOT).as_posix()
+        action = "Изменить" if path.exists() else "Создать"
+        return {
+            "summary": f"{action} файл {rel} (изменение будет закоммичено в git)",
+            "diff": _source_diff(path, content),
+        }
+
+    if tool_name == "rollback_source_change":
+        info = git_guard.last_agent_commit(PROJECT_ROOT)
+        return {
+            "summary": f"Откатить коммит {info.sha[:8]} «{info.subject}»",
+            "files": info.files,
+        }
+
+    if tool_name == "open_application":
+        app_name = str(args.get("app_name", "")).strip()
+        if not app_name:
+            raise ToolExecutionError("Parameter 'app_name' is required")
+        return {"summary": f"Запустить приложение: {app_name}"}
+
+    return {"summary": f"Выполнить {tool_name}"}
 
 
 async def set_reminder(minutes: int, reminder_text: str) -> str:
@@ -289,6 +397,7 @@ TOOL_REGISTRY = {
     "analyze_screen": analyze_screen,
     "read_source_code": read_source_code,
     "update_source_code": update_source_code,
+    "rollback_source_change": rollback_source_change,
     "set_reminder": set_reminder,
 }
 
@@ -390,7 +499,10 @@ TOOLS_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "update_source_code",
-            "description": "Update project source/rules file; .py content is syntax-checked before save.",
+            "description": (
+                "Update project source/rules file; .py content is syntax-checked before save. "
+                "Requires user confirmation; the change is committed to git."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -405,6 +517,17 @@ TOOLS_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "required": ["file_name", "new_content"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rollback_source_change",
+            "description": (
+                "Revert the latest change made by update_source_code (git revert). "
+                "Works only if the last commit was made by the agent. Requires user confirmation."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -448,6 +571,21 @@ async def execute_tool(tool_name: str, args: dict[str, Any] | None = None) -> di
         }
 
     try:
+        if tool_name in CONFIRMATION_REQUIRED_TOOLS:
+            # Валидируем до вопроса пользователю, чтобы не спрашивать о заведомо невыполнимом.
+            details = await asyncio.to_thread(describe_tool_call, tool_name, args)
+            approved = False
+            if _confirmation_callback is not None:
+                approved = await _confirmation_callback(tool_name, args, details)
+            if not approved:
+                return {
+                    "ok": False,
+                    "tool": tool_name,
+                    "error": (
+                        "Пользователь не подтвердил выполнение. "
+                        "Не повторяй вызов без новой просьбы пользователя."
+                    ),
+                }
         return await tool(**args)
     except PermissionError as exc:
         return {
@@ -461,7 +599,7 @@ async def execute_tool(tool_name: str, args: dict[str, Any] | None = None) -> di
             "tool": tool_name,
             "error": f"Invalid arguments for '{tool_name}': {exc}",
         }
-    except ToolExecutionError as exc:
+    except (ToolExecutionError, git_guard.GitGuardError) as exc:
         return {
             "ok": False,
             "tool": tool_name,

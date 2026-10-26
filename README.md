@@ -6,7 +6,8 @@ A fully local, asynchronous, proactive voice assistant with OS integration, web-
 J.A.R.V.I.S. runs on your local machine, connects to a local OpenAI-compatible LLM endpoint (like LM Studio or vLLM), performs system operations through local tools, receives commands from your browser via WebSocket, and supports proactive background triggers.
 
 ## Key Features
-- **Self-Modifying Code**: Safe reading and modification of its own codebase (`read_source_code`, `update_source_code`) with Python syntax validation before saving.
+- **Self-Modifying Code**: Safe reading and modification of its own codebase (`read_source_code`, `update_source_code`) with Python syntax validation, a diff the user must approve, and an automatic git commit per change (undo with `rollback_source_change` or `make rollback`).
+- **Confirmation for sensitive tools**: `update_source_code`, `rollback_source_change` and `open_application` run only after the user clicks "Allow" in the web UI (or answers `y` in the console). No answer within `JARVIS_CONFIRM_TIMEOUT` seconds (default 120) or a disconnect means "deny".
 - **MCP Integration**: Connect external MCP servers using `mcp_config.json` and automatically route tool calls.
 - **Fast Local TTS/STT**: Fast speech synthesis via `edge-tts` and high-speed local audio transcription via `faster-whisper`.
 - **Flexible Tool Calling**: Desktop application control, web search, visual screen analysis (vision model), timers, and reminders.
@@ -67,3 +68,5 @@ cp mcp_config.example.json mcp_config.json
 - `make sync` — Install or synchronize dependencies using `uv`.
 - `make dev` — Run the FastAPI server with autoreload enabled for web development.
 - `make run` — Launch J.A.R.V.I.S. in CLI console mode (without the Web UI).
+- `make rollback` — Revert the last agent-made code change (works even if the server no longer starts).
+- `make test` — Run the test suite.

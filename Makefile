@@ -1,4 +1,4 @@
-.PHONY: sync dev run
+.PHONY: sync dev run rollback test
 
 sync:
 	uv sync
@@ -8,3 +8,9 @@ dev:
 
 run:
 	uv run python -m src.jarvis_backend.main
+
+rollback:
+	python3 -m src.jarvis_backend.git_guard
+
+test:
+	uv run --with pytest --with pytest-asyncio --with httpx pytest -q
