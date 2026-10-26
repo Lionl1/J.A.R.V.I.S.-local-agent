@@ -33,6 +33,9 @@ jarvis_memory.db
 *.wav
 *.mp3
 
+# Agent state (conversation history)
+.jarvis/
+
 # Runtime logs
 *.log
 

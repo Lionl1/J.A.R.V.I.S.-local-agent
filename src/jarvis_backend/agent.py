@@ -5,13 +5,10 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from openai import AsyncOpenAI
-from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError
-
+from .brain import Brain, make_brain
 from .config import settings
-from .tools import execute_tool
 
 FALLBACK_SYSTEM_PROMPT = (
     "You are J.A.R.V.I.S., a local AI assistant. "
@@ -20,6 +17,10 @@ FALLBACK_SYSTEM_PROMPT = (
     "Do not use markdown in your final verbal replies. "
     "Automatically detect the user's language and respond in the same language based on context."
 )
+
+ToolsProvider = Callable[[], Awaitable[list[dict[str, Any]]]]
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]
+EventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 def _get_rules_path() -> Path:
@@ -40,6 +41,16 @@ def _load_system_prompt() -> str:
     return FALLBACK_SYSTEM_PROMPT
 
 
+def parse_tool_arguments(arguments: str | None) -> dict[str, Any]:
+    if not arguments:
+        return {}
+    try:
+        payload = json.loads(arguments)
+    except Exception:  # noqa: BLE001
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 @dataclass(slots=True)
 class ActionCall:
     tool: str
@@ -55,147 +66,209 @@ class AgentDecision:
 
 
 class AgentCore:
+    """Мозг (любой LLM) + история + цикл вызова инструментов.
+
+    Один и тот же цикл используется веб-сервером и консольным режимом.
+    История сохраняется на диск, поэтому переживает перезапуск после самоправки кода.
+    """
+
     def __init__(
         self,
-        model: str | None = None,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        temperature: float | None = None,
-        timeout: float | None = None,
+        brain: Brain | None = None,
+        *,
+        tools_provider: ToolsProvider | None = None,
+        tool_executor: ToolExecutor | None = None,
+        history_path: Path | None = None,
+        max_tool_steps: int | None = None,
+        max_history: int | None = None,
     ) -> None:
-        self.model = (model or settings.model).strip()
-        self.base_url = (base_url or settings.base_url).strip().rstrip("/")
-        self.temperature = settings.llm_temperature if temperature is None else temperature
-        self.timeout = settings.llm_timeout if timeout is None else timeout
+        self.brain = brain or make_brain()
+        self.tools_provider = tools_provider
+        self.tool_executor = tool_executor
+        self.max_tool_steps = max_tool_steps or settings.max_tool_steps
+        self.max_history = max_history or settings.max_history_messages
+        self.history_path = history_path
         self.system_prompt = _load_system_prompt()
-        self.client = AsyncOpenAI(
-            base_url=self.base_url,
-            api_key=(api_key or settings.api_key or "local-key"),
-            timeout=self.timeout,
-        )
-        self.messages: list[dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
+        self.messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        self._load_history()
 
-    def _trim_memory(self, max_messages: int = 20) -> None:
-        """Trim conversation history while preserving system prompt and turn integrity.
+    @property
+    def model(self) -> str:
+        return self.brain.model
 
-        Strategy:
-        - keep system message at index 0 always;
-        - remove oldest completed user turns first;
-        - each removed turn includes user/assistant (+tool messages if any),
-          which preserves tool_call chains.
+    # ---- история
+
+    def reload_system_prompt(self) -> None:
+        """Подхватить отредактированный jarvis_rules.md без перезапуска."""
+        self.system_prompt = _load_system_prompt()
+        self.messages[0] = {"role": "system", "content": self.system_prompt}
+
+    def reset(self) -> None:
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+        self.save_history()
+
+    def _load_history(self) -> None:
+        if self.history_path is None or not self.history_path.exists():
+            return
+        try:
+            data = json.loads(self.history_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to load history {self.history_path}: {exc}")
+            return
+        if isinstance(data, list):
+            self.messages.extend(m for m in data if isinstance(m, dict) and m.get("role") != "system")
+            self._repair_history()
+            self._trim_memory()
+
+    def save_history(self) -> None:
+        if self.history_path is None:
+            return
+        try:
+            self.history_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.history_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps([_strip_images(m) for m in self.messages[1:]], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(self.history_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to save history: {exc}")
+
+    def _trim_memory(self, max_messages: int | None = None) -> None:
+        """Удаляет самые старые целые ходы (user + ответы + tool), сохраняя system.
+
+        Режем только с начала и только целыми ходами: цепочки tool_call остаются целыми,
+        а у Claude это не ломает подписи thinking-блоков.
         """
-        if max_messages < 2:
-            max_messages = 2
-
-        if len(self.messages) <= max_messages:
+        limit = max(2, max_messages or self.max_history)
+        if len(self.messages) <= limit:
             return
 
-        # Build turn ranges from the first non-system message.
-        turns: list[tuple[int, int]] = []
-        start_idx: int | None = None
-        for idx in range(1, len(self.messages)):
-            role = str(self.messages[idx].get("role", ""))
-            if role == "user":
-                if start_idx is not None:
-                    turns.append((start_idx, idx))
-                start_idx = idx
-        if start_idx is not None:
-            turns.append((start_idx, len(self.messages)))
-
-        # Remove oldest complete turns until size is under limit.
-        removed = 0
-        for start, end in turns:
-            if len(self.messages) - removed <= max_messages:
+        user_indexes = [i for i in range(1, len(self.messages)) if self.messages[i].get("role") == "user"]
+        cut = None
+        for idx in user_indexes[1:]:
+            cut = idx
+            if 1 + len(self.messages) - idx <= limit:
                 break
-            # Shift by already removed count.
-            adj_start = max(1, start - removed)
-            adj_end = max(adj_start, end - removed)
-            if adj_start < adj_end:
-                del self.messages[adj_start:adj_end]
-                removed += (adj_end - adj_start)
+        if cut is not None:
+            del self.messages[1:cut]
 
-        # Fallback: if no turns were detected but still too large, keep tail.
-        if len(self.messages) > max_messages:
-            self.messages = [self.messages[0], *self.messages[-(max_messages - 1):]]
+        if len(self.messages) > limit:
+            # Один гигантский ход: оставляем хвост, начиная с ближайшего user-сообщения.
+            tail = self.messages[-(limit - 1):]
+            while tail and tail[0].get("role") != "user":
+                tail.pop(0)
+            self.messages = [self.messages[0], *tail]
 
-    async def _ask_llm(
+    # ---- цикл агента
+
+    async def run_turn(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None = None,
-        return_message: bool = False,
-    ) -> str | dict[str, Any]:
-        # Apply memory trimming before each model request.
-        self._trim_memory(max_messages=20)
+        user_content: str | list[dict[str, Any]],
+        on_event: EventCallback | None = None,
+    ) -> str:
+        """Один ход: реплика пользователя -> (инструменты)* -> финальный ответ."""
+        self._trim_memory()
+        self.messages.append({"role": "user", "content": user_content})
         try:
-            payload: dict[str, Any] = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": self.temperature,
+            return await self._loop(on_event)
+        finally:
+            self.save_history()
+
+    def has_interrupted_turn(self) -> bool:
+        """История заканчивается результатом инструмента — процесс перезапустился посреди хода."""
+        return len(self.messages) > 1 and self.messages[-1].get("role") == "tool"
+
+    async def resume_turn(self, on_event: EventCallback | None = None) -> str:
+        """Довести прерванный ход до финального ответа (например, после самоправки ядра)."""
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "[Система] Процесс был перезапущен во время выполнения инструментов "
+                    "(например, после изменения твоего кода). Продолжи задачу с того места, "
+                    "где остановился, и кратко сообщи пользователю результат."
+                ),
             }
-            if tools:
-                payload["tools"] = tools
-                payload["tool_choice"] = "auto"
+        )
+        try:
+            return await self._loop(on_event)
+        except Exception as exc:  # noqa: BLE001
+            text = f"Не удалось продолжить прерванную задачу: {exc}"
+            self.messages.append({"role": "assistant", "content": text})
+            return text
+        finally:
+            self.save_history()
 
-            try:
-                response = await self.client.chat.completions.create(**payload)
-            except APIStatusError as exc:
-                # Некоторые OpenAI-compatible провайдеры/модели не поддерживают tools.
-                # Делаем безопасный fallback на обычный chat completion.
-                if tools and exc.status_code == 400:
-                    fallback_payload = {
-                        "model": self.model,
-                        "messages": messages,
-                        "temperature": self.temperature,
-                    }
-                    response = await self.client.chat.completions.create(
-                        **fallback_payload
-                    )
-                else:
-                    raise
-        except APITimeoutError as exc:
-            raise RuntimeError(
-                f"LLM timeout: endpoint={self.base_url}, model={self.model}"
-            ) from exc
-        except APIConnectionError as exc:
-            raise RuntimeError(
-                f"LLM connection error: endpoint={self.base_url}. "
-                "Проверьте доступность сервера и URL /v1."
-            ) from exc
-        except AuthenticationError as exc:
-            raise RuntimeError(
-                f"LLM auth error: endpoint={self.base_url}. "
-                "Проверьте API key."
-            ) from exc
-        except APIStatusError as exc:
-            raise RuntimeError(
-                f"LLM HTTP error {exc.status_code}: endpoint={self.base_url}, model={self.model}"
-            ) from exc
+    def _repair_history(self) -> None:
+        """Каждый tool_call должен иметь ответ, иначе API отвергнет историю."""
+        repaired: list[dict[str, Any]] = []
+        pending: list[str] = []
+        for msg in self.messages:
+            if msg.get("role") == "tool":
+                call_id = str(msg.get("tool_call_id", ""))
+                if call_id in pending:
+                    pending.remove(call_id)
+                    repaired.append(msg)
+                continue
+            for call_id in pending:
+                repaired.append({"role": "tool", "tool_call_id": call_id, "content": "Результат утерян: процесс был перезапущен."})
+            pending = []
+            repaired.append(msg)
+            if msg.get("role") == "assistant":
+                pending = [str(c.get("id", "")) for c in msg.get("tool_calls") or []]
+        for call_id in pending:
+            repaired.append({"role": "tool", "tool_call_id": call_id, "content": "Результат утерян: процесс был перезапущен."})
+        self.messages = repaired
 
-        message = response.choices[0].message
-        if return_message:
-            tool_calls: list[dict[str, Any]] = []
-            if message.tool_calls:
-                for call in message.tool_calls:
-                    tool_calls.append(
+    async def _loop(self, on_event: EventCallback | None) -> str:
+        for step in range(1, self.max_tool_steps + 1):
+            tools = await self.tools_provider() if self.tools_provider else []
+            reply = await self.brain.chat(self.messages, tools=tools)
+
+            if not reply.tool_calls:
+                # Совместимость: модели без function calling иногда отвечают JSON {speech, action}.
+                decision = self._parse_decision(reply.content) if reply.content.lstrip().startswith(("{", "```")) else None
+                if decision and decision.action is not None and self.tool_executor is not None:
+                    call_id = f"json_{step}"
+                    reply.tool_calls = [
                         {
-                            "id": call.id,
-                            "type": call.type,
+                            "id": call_id,
+                            "type": "function",
                             "function": {
-                                "name": call.function.name,
-                                "arguments": call.function.arguments,
+                                "name": decision.action.tool,
+                                "arguments": json.dumps(decision.action.args, ensure_ascii=False),
                             },
                         }
-                    )
-            return {
-                "content": (message.content or "").strip(),
-                "tool_calls": tool_calls,
-            }
+                    ]
+                else:
+                    speech = (decision.speech if decision else reply.content) or "Готово."
+                    self.messages.append({"role": "assistant", "content": reply.content or speech, **reply.extra})
+                    return speech
 
-        content = message.content
-        if not content:
-            return ""
-        return content.strip()
+            self.messages.append(
+                {"role": "assistant", "content": reply.content, "tool_calls": reply.tool_calls, **reply.extra}
+            )
+            for call in reply.tool_calls:
+                fn = call.get("function", {})
+                name = str(fn.get("name", "")).strip()
+                args = parse_tool_arguments(fn.get("arguments"))
+                call_id = str(call.get("id", "")).strip() or f"call_{step}"
+                if on_event:
+                    await on_event("tool_call", {"name": name, "args": args, "id": call_id})
+                if self.tool_executor is None:
+                    result = json.dumps({"ok": False, "error": "Инструменты недоступны"}, ensure_ascii=False)
+                else:
+                    result = await self.tool_executor(name, args)
+                if on_event:
+                    await on_event("tool_result", {"name": name, "result": result, "id": call_id})
+                self.messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+                # Сохраняем после каждого инструмента: правка кода может перезапустить процесс.
+                self.save_history()
+
+        fallback = "Превышен лимит шагов инструментов. Уточни задачу, и я продолжу."
+        self.messages.append({"role": "assistant", "content": fallback})
+        return fallback
 
     def _parse_decision(self, text: str) -> AgentDecision:
         payload = self._safe_extract_json(text)
@@ -319,3 +392,17 @@ class AgentCore:
             return None
 
         return None
+
+
+def _strip_images(message: dict[str, Any]) -> dict[str, Any]:
+    """Не тащим base64-картинки в файл истории."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    parts = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            parts.append({"type": "text", "text": "[изображение]"})
+        else:
+            parts.append(part)
+    return {**message, "content": parts}
