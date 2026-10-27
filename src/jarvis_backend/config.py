@@ -129,6 +129,7 @@ class Settings:
     wake_device: str | None
     wake_model: str
     voice_reply_local: bool
+    voice_debug: bool
 
     state_dir: Path
     skills_dir: Path
@@ -199,6 +200,7 @@ class Settings:
             wake_device=_env_optional_str("JARVIS_WAKE_DEVICE"),
             wake_model=_env_str("JARVIS_WAKE_MODEL", "hey_jarvis"),
             voice_reply_local=_env_bool("JARVIS_VOICE_REPLY_LOCAL", True),
+            voice_debug=_env_bool("JARVIS_VOICE_DEBUG", False),
             state_dir=project_root / ".jarvis",
             skills_dir=source_root / "skills",
             verify_changes=_env_bool("JARVIS_VERIFY_CHANGES", True),

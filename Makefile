@@ -1,4 +1,4 @@
-.PHONY: sync dev start run rollback test autostart-install autostart-uninstall autostart-status
+.PHONY: sync dev start run rollback test autostart-install autostart-uninstall autostart-status on off stop
 
 sync:
 	uv sync
@@ -29,3 +29,16 @@ autostart-uninstall:
 
 autostart-status:
 	python3 -m src.jarvis_backend.autostart status
+
+# Аварийный выключатель: остановить всё (и запущенное вручную), убрать автозапуск, выгрузить модель.
+# Работает системным python3, даже если правка агента сломала проект.
+off:
+	python3 -m src.jarvis_backend.autostart off
+
+# Включить всё обратно: LM Studio + модель + автозапуск Джарвиса.
+on:
+	python3 -m src.jarvis_backend.autostart on
+
+# Остановить до следующего входа в систему.
+stop:
+	python3 -m src.jarvis_backend.autostart stop

@@ -520,6 +520,24 @@ async def run_shell_command(command: str, timeout: float | None = None) -> dict[
     }
 
 
+async def stop_jarvis() -> dict[str, Any]:
+    """Shut Jarvis down (until the next login / manual start)."""
+    import os
+    import signal
+
+    async def _stop_later() -> None:
+        await asyncio.sleep(4.0)  # даём договорить ответ
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    task = asyncio.create_task(_stop_later(), name="jarvis_stop")
+    _reminder_tasks.add(task)
+    return {
+        "ok": True,
+        "tool": "stop_jarvis",
+        "result": "Джарвис завершит работу через несколько секунд. Снова включить: make on или вход в систему.",
+    }
+
+
 def reload_skills() -> skills_pkg.SkillSet:
     """(Пере)загрузить навыки из skills/*.py."""
     global _skills, skills_version
@@ -580,6 +598,7 @@ TOOL_REGISTRY = {
     "rollback_source_change": rollback_source_change,
     "run_shell_command": run_shell_command,
     "set_reminder": set_reminder,
+    "stop_jarvis": stop_jarvis,
 }
 
 
@@ -758,6 +777,17 @@ TOOLS_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "required": ["command"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_jarvis",
+            "description": (
+                "Shut yourself down completely (stop listening to the microphone and exit). "
+                "Use ONLY when the user directly asks you to turn off / shut down / stop working."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {

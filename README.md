@@ -37,7 +37,13 @@ fallbacks (`fallbacks: "default"`) are enabled for models that support them.
 - **Autostart**: `make autostart-install` registers a LaunchAgent (macOS) or a systemd user unit (Linux) that starts
   Jarvis at login and restarts it after a crash; logs go to `.jarvis/logs/jarvis.log`.
   `make autostart-status`, `make autostart-uninstall`.
-- On macOS, allow microphone access for Python the first time (System Settings → Privacy & Security → Microphone).
+- On macOS the background service runs as a small locally signed `Jarvis.app` (`.jarvis/Jarvis.app`): macOS grants
+  microphone access to apps, and a bare `python` started by launchd silently gets silence. Allow "Jarvis" in
+  System Settings → Privacy & Security → Microphone. `JARVIS_VOICE_DEBUG=true` logs levels and every heard phrase
+  (and keeps the last 20 phrases as WAV in `.jarvis/voice_debug/` — it records the room, turn it off afterwards).
+- **Kill switch**: `make off` (or double-click `scripts/jarvis-off.command`) stops Jarvis — including copies started
+  by hand — removes autostart, unloads the LM Studio model and stops its server. `make on` / `scripts/jarvis-on.command`
+  turns everything back on; `make stop` stops only until the next login. Saying «Джарвис, выключись» stops it too.
 
 ## Self-improvement (RSI) loop
 1. Jarvis reads its files (`list_source_files`, `read_source_code`).
@@ -121,4 +127,5 @@ cp mcp_config.example.json mcp_config.json
 - `make run` — Launch J.A.R.V.I.S. in CLI console mode (without the Web UI).
 - `make rollback` — Revert the last agent-made code change (works even if the server no longer starts).
 - `make test` — Run the test suite.
+- `make on` / `make off` — Turn everything on / off (kill switch).
 - `make autostart-install` / `autostart-status` / `autostart-uninstall` — Start Jarvis at login.

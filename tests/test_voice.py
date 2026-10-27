@@ -150,10 +150,11 @@ def test_launch_agent_plist_runs_server_from_project() -> None:
     plist = autostart.build_plist()
     plistlib.dumps(plist)  # сериализуется
 
+    command = " ".join(plist["ProgramArguments"])
     assert plist["Label"] == autostart.LABEL
     assert plist["WorkingDirectory"] == str(autostart.PROJECT_ROOT)
-    assert "src.jarvis_backend.server:app" in plist["ProgramArguments"]
-    assert "127.0.0.1" in plist["ProgramArguments"]
+    assert "src.jarvis_backend.server:app" in command
+    assert "127.0.0.1" in command
     assert plist["KeepAlive"] == {"SuccessfulExit": False}
     assert "/opt/homebrew/bin" in plist["EnvironmentVariables"]["PATH"]
 
@@ -164,3 +165,12 @@ def test_systemd_unit_restarts_on_failure() -> None:
     assert "Restart=on-failure" in unit
     assert "src.jarvis_backend.server:app" in unit
     assert f"WorkingDirectory={autostart.PROJECT_ROOT}" in unit
+
+
+def test_bundle_command_uses_only_project_packages(tmp_path) -> None:
+    command = autostart._bundle_command(tmp_path / "Jarvis")
+    if command is None:
+        pytest.skip("нет .venv")
+    assert command[1] == "-S"  # без глобальных site-packages системного Python
+    assert "site.addsitedir" in command[3] and ".venv" in command[3]
+    compile(command[3], "<launcher>", "exec")

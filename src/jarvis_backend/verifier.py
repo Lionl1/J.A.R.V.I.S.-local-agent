@@ -60,12 +60,15 @@ def _tail(text: str) -> str:
     return text
 
 
-def _pytest_available() -> bool:
-    try:
-        import pytest  # noqa: F401
-    except ImportError:
-        return False
-    return True
+def _python_for(project_root: Path) -> str:
+    """Интерпретатор с зависимостями проекта (в Jarvis.app sys.executable — голый Python)."""
+    venv_python = project_root / ".venv" / "bin" / "python"
+    return str(venv_python) if venv_python.exists() else sys.executable
+
+
+def _pytest_available(python: str) -> bool:
+    result = subprocess.run([python, "-c", "import pytest"], capture_output=True, check=False)
+    return result.returncode == 0
 
 
 def _run(cmd: list[str], cwd: Path, env: dict[str, str], timeout: float) -> tuple[int, str]:
@@ -96,6 +99,7 @@ def verify_change(
         # Правила (.md), UI (.html) и конфиги не ломают импорт — достаточно проверок выше.
         return VerifyResult(True, "static", "")
 
+    python = _python_for(project_root)
     with tempfile.TemporaryDirectory(prefix="jarvis-verify-") as tmp:
         sandbox = Path(tmp) / "project"
         sandbox.mkdir()
@@ -127,18 +131,18 @@ def verify_change(
         )
 
         code, out = _run(
-            [sys.executable, "-m", "compileall", "-q", "src"], sandbox, env, timeout
+            [python, "-m", "compileall", "-q", "src"], sandbox, env, timeout
         )
         if code != 0:
             return VerifyResult(False, "compile", _tail(out))
 
-        code, out = _run([sys.executable, "-c", _IMPORT_SMOKE], sandbox, env, timeout)
+        code, out = _run([python, "-c", _IMPORT_SMOKE], sandbox, env, timeout)
         if code != 0:
             return VerifyResult(False, "import", _tail(out))
 
-        if run_tests and (sandbox / "tests").is_dir() and _pytest_available():
+        if run_tests and (sandbox / "tests").is_dir() and _pytest_available(python):
             code, out = _run(
-                [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "tests"],
+                [python, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "tests"],
                 sandbox,
                 env,
                 timeout,

@@ -50,7 +50,9 @@ class SpeechSegmenter:
         *,
         frame_samples: int = FRAME_SAMPLES,
         start_factor: float = 3.0,
-        min_level: float = 300.0,
+        # Нижняя граница порога; основной порог — шум × start_factor.
+        # Тихие USB-микрофоны дают речь всего 250–700 RMS, поэтому граница низкая.
+        min_level: float = 120.0,
         silence_ms: int = 800,
         max_ms: int = 20000,
         preroll_ms: int = 300,
@@ -144,6 +146,7 @@ class VoiceListener:
         self.language = None if (language or "").lower() in {"", "auto"} else language
         self.device = device if device is not None else settings.wake_device
         self._transcribe = transcribe or self._whisper_transcribe
+        self.debug = settings.voice_debug
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._queue: asyncio.Queue[tuple[str, Any]] | None = None
@@ -264,11 +267,22 @@ class VoiceListener:
         oww_buffer = np.zeros(0, dtype=np.int16)
         silent_frames = 0
         warned_silence = False
+        debug_peak = 0.0
         try:
             while not self._stop.is_set():
                 data = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
                 frame = np.frombuffer(data, dtype=np.int16)
                 self._frames_read += 1
+                if self.debug:
+                    level = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+                    debug_peak = max(debug_peak, level)
+                    if self._frames_read % (5 * SAMPLE_RATE // FRAME_SAMPLES) == 0:
+                        print(
+                            f"[VOICE] level: peak_rms={debug_peak:.0f} noise={segmenter.noise_floor or 0:.0f} "
+                            f"threshold={segmenter._threshold():.0f} muted={self._is_muted()}",
+                            flush=True,
+                        )
+                        debug_peak = 0.0
 
                 # macOS без разрешения на микрофон отдаёт сплошные нули, а не ошибку.
                 if not warned_silence:
@@ -320,6 +334,10 @@ class VoiceListener:
 
         model = _get_whisper_model()
         audio = segment.astype(np.float32) / 32768.0
+        peak = float(np.abs(audio).max()) if audio.size else 0.0
+        if peak > 0:
+            # Тихий микрофон: выравниваем громкость, иначе Whisper возвращает пустоту или мусор.
+            audio *= min(0.9 / peak, 30.0)
         # Подсказка помогает расслышать одиночное «Джарвис!», но в длинной фразе модель
         # иногда считает имя уже сказанным и выбрасывает его — поэтому только вторым проходом.
         extra = {"hotwords": "Джарвис"} if hint_name else {}
@@ -341,7 +359,12 @@ class VoiceListener:
                 if kind == "wake":
                     await self._wake()
                     continue
+                if self.debug:
+                    _save_debug_segment(payload)
                 text = await asyncio.to_thread(self._recognize, payload)
+                if self.debug:
+                    level = float(np.sqrt(np.mean(payload.astype(np.float32) ** 2)))
+                    print(f"[VOICE] heard {len(payload) / SAMPLE_RATE:.1f}s rms={level:.0f}: {text!r}", flush=True)
                 if not text:
                     continue
                 await self.handle_text(text)
@@ -381,6 +404,22 @@ class VoiceListener:
     async def _dispatch(self, command: str) -> None:
         print(f"[VOICE] command: {command}", flush=True)
         await self.on_command(command)
+
+
+def _save_debug_segment(segment: np.ndarray) -> None:
+    """JARVIS_VOICE_DEBUG: последние 20 услышанных фраз в .jarvis/voice_debug/*.wav."""
+    import wave
+
+    folder = settings.state_dir / "voice_debug"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.wav"
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(SAMPLE_RATE)
+        out.writeframes(segment.astype(np.int16).tobytes())
+    for old in sorted(folder.glob("*.wav"))[:-20]:
+        old.unlink(missing_ok=True)
 
 
 def _load_openwakeword():
