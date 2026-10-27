@@ -161,3 +161,12 @@ def test_history_conversion_for_claude() -> None:
         [{"type": "function", "function": {"name": "t", "description": "d", "parameters": {"type": "object"}}}]
     )
     assert tools == [{"name": "t", "description": "d", "input_schema": {"type": "object"}}]
+
+
+def test_reasoning_is_stripped_from_local_model_output() -> None:
+    from jarvis_backend.brain import strip_reasoning
+
+    assert strip_reasoning("<think>считаю время</think>\nСейчас полдень.") == "Сейчас полдень."
+    assert strip_reasoning("Ответ") == "Ответ"
+    # Незакрытый блок (обрыв генерации) тоже не попадает в речь.
+    assert strip_reasoning("Готово. <think>а ещё") == "Готово."

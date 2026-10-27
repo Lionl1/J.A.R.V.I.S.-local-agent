@@ -21,6 +21,15 @@ from .config import Settings, settings
 CONNECT_TIMEOUT = 5.0
 
 
+_THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """Локальные reasoning-модели (Qwen, DeepSeek-R1…) пишут размышления в <think>…</think> —
+    их нельзя зачитывать вслух и хранить как ответ."""
+    return _THINK_RE.sub("", text).strip()
+
+
 class BrainError(RuntimeError):
     """LLM недоступна или вернула ошибку; текст пригоден для показа пользователю."""
 
@@ -140,7 +149,7 @@ class OpenAICompatBrain(Brain):
             }
             for call in (message.tool_calls or [])
         ]
-        return BrainReply(content=(message.content or "").strip(), tool_calls=tool_calls)
+        return BrainReply(content=strip_reasoning(message.content or ""), tool_calls=tool_calls)
 
 
 # --------------------------------------------------------------------------- Anthropic (Claude)
