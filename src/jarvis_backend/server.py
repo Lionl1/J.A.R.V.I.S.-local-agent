@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
+import sys
 from base64 import b64decode
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -13,48 +16,80 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.status import HTTP_401_UNAUTHORIZED
 
+from . import tools
 from .agent import AgentCore
-from .audio import synthesize_speech_base64, transcribe_audio_bytes
+from .audio import speak, synthesize_speech_base64, transcribe_audio_bytes
+from .brain import BrainError
 from .config import settings
 from .mcp_manager import MCPManager
 from .triggers import DirectoryWatcher
+from .wake import VoiceListener
 from .tools import (
-    LOCAL_TOOL_NAMES,
-    TOOLS_SCHEMAS,
     execute_tool,
+    get_tool_schemas,
+    is_local_tool,
     set_confirmation_callback,
     set_proactive_callback,
+    set_rules_changed_callback,
 )
 
-API_KEY = settings.api_key.strip()
-MODEL_NAME = settings.model
-BASE_URL = settings.base_url
-MAX_TOOL_STEPS = settings.max_tool_steps
+API_KEY = settings.server_api_key.strip()
 TRIGGER_WATCH_DIR = (settings.trigger_watch_dir or "").strip()
 CONFIRM_TIMEOUT = settings.confirm_timeout
 
 if not API_KEY:
     raise RuntimeError(
-        "JARVIS_API_KEY не задан. Укажите переменную окружения (или .env), "
+        "JARVIS_SERVER_API_KEY / JARVIS_API_KEY не задан. Укажите переменную окружения (или .env), "
         "иначе сервер не будет запущен по соображениям безопасности."
     )
 
 
+async def _all_tools() -> list[dict[str, Any]]:
+    return get_tool_schemas() + await mcp_manager.get_all_tools()
+
+
+async def _route_tool_call(tool_name: str, args: dict[str, Any]) -> str:
+    if is_local_tool(tool_name):
+        result = await execute_tool(tool_name, args)
+        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+    return await mcp_manager.execute_tool(tool_name, args)
+
+
+async def _broadcast_tools() -> None:
+    await send_to_ws_safe(None, {"type": "tools_list", "payload": await _all_tools()})
+
+
 # Глобальный singleton агента (однопользовательский режим).
-agent = AgentCore(model=MODEL_NAME, base_url=BASE_URL)
+agent = AgentCore(
+    tools_provider=_all_tools,
+    tool_executor=_route_tool_call,
+    history_path=settings.state_dir / "history.json",
+)
 # Lock защищает историю сообщений от гонок при параллельных запросах/сокетах.
 agent_lock: asyncio.Lock = asyncio.Lock()
-mcp_manager = MCPManager()
+mcp_manager = MCPManager(on_tools_changed=_broadcast_tools)
 active_websocket: WebSocket | None = None
 websocket_send_lock: asyncio.Lock = asyncio.Lock()
 directory_watcher: DirectoryWatcher | None = None
+voice_listener: VoiceListener | None = None
 directory_watcher_task: asyncio.Task[Any] | None = None
 # Ожидающие ответа пользователя подтверждения: id -> (future, сокет, которому отправлен запрос).
 pending_confirmations: dict[str, tuple[asyncio.Future[bool], WebSocket]] = {}
 # Turn'ы агента выполняются фоном, чтобы цикл приёма мог получить ответ на подтверждение.
 background_turns: set[asyncio.Task[Any]] = set()
 
-app = FastAPI(title="J.A.R.V.I.S. Local Server", version="1.0.0")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await on_startup()
+    try:
+        yield
+    finally:
+        await on_shutdown()
+
+
+app = FastAPI(title="J.A.R.V.I.S. Local Server", version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -137,11 +172,18 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.on_event("startup")
 async def on_startup() -> None:
+    print(f"[JARVIS] brain: {agent.brain.label()}")
     set_proactive_callback(trigger_proactive_message)
     set_confirmation_callback(request_confirmation)
+    set_rules_changed_callback(agent.reload_system_prompt)
+    # MCP поднимается в фоне: npx/uvx могут качать пакеты десятки секунд.
     await mcp_manager.start()
+
+    global voice_listener
+    if settings.wake_word:
+        voice_listener = VoiceListener(_handle_voice_command, on_wake=_on_voice_wake)
+        await voice_listener.start()
 
     global directory_watcher, directory_watcher_task
     if TRIGGER_WATCH_DIR:
@@ -155,10 +197,14 @@ async def on_startup() -> None:
         )
 
 
-@app.on_event("shutdown")
 async def on_shutdown() -> None:
     set_proactive_callback(None)
     set_confirmation_callback(None)
+    set_rules_changed_callback(None)
+    global voice_listener
+    if voice_listener is not None:
+        await voice_listener.stop()
+        voice_listener = None
     _deny_pending_confirmations(None)
     global directory_watcher, directory_watcher_task
     if directory_watcher is not None:
@@ -193,14 +239,31 @@ async def _send_status(websocket: WebSocket, status: str) -> None:
     await send_to_ws_safe(websocket, {"type": "status", "payload": status})
 
 
+async def _speak_locally(text: str) -> None:
+    """Произнести через динамики компьютера (фоновый режим без открытого UI)."""
+    try:
+        if voice_listener is not None:
+            async with voice_listener.muted():
+                await speak(text)
+        else:
+            await speak(text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[VOICE] TTS error: {exc}", flush=True)
+
+
+def _reply_locally() -> bool:
+    return active_websocket is None or (voice_listener is not None and settings.voice_reply_local)
+
+
 async def trigger_proactive_message(message: str) -> None:
-    """Send proactive speech_text/audio to currently active websocket."""
+    """Проактивное сообщение (напоминание, триггер): в UI и/или голосом из динамиков."""
     text = (message or "").strip()
-    if not text or active_websocket is None:
+    if not text:
         return
 
-    ok = await send_to_ws_safe(None, {"type": "speech_text", "payload": text})
-    if not ok:
+    await send_to_ws_safe(None, {"type": "speech_text", "payload": text})
+    if _reply_locally():
+        await _speak_locally(text)
         return
 
     try:
@@ -290,113 +353,90 @@ async def _handle_trigger_prompt(prompt: str) -> None:
     await trigger_proactive_message(final_speech)
 
 
-def _parse_tool_arguments(arguments: str | None) -> dict[str, Any]:
-    if not arguments:
-        return {}
+async def _emit_agent_event(kind: str, payload: dict[str, Any]) -> None:
+    """tool_call / tool_result -> живая лента инструментов в UI."""
+    await send_to_ws_safe(None, {"type": kind, "payload": payload})
+
+
+async def _run_agent_turn(user_text: str | list[dict[str, Any]]) -> str:
+    """Один turn агента с function-calling (local + skills + MCP tools)."""
     try:
-        payload = json.loads(arguments)
-        if isinstance(payload, dict):
-            return payload
-    except Exception:  # noqa: BLE001
-        return {}
-    return {}
+        return await agent.run_turn(user_text, on_event=_emit_agent_event)
+    except BrainError as exc:
+        return str(exc)
 
 
-async def _route_tool_call(tool_name: str, args: dict[str, Any]) -> str:
-    if tool_name in LOCAL_TOOL_NAMES:
-        result = await execute_tool(tool_name, args)
-        return json.dumps(result, ensure_ascii=False)
-    return await mcp_manager.execute_tool(tool_name, args)
+def _schedule_restart_if_needed() -> None:
+    """После правки ядра перезапускаем процесс (история сохранена на диске).
+
+    Под `uvicorn --reload` процесс к этому моменту уже перезапущен наблюдателем файлов,
+    поэтому сюда попадаем только в режиме `make start`.
+    """
+    if not tools.restart_required:
+        return
+    tools.restart_required = False
+
+    async def _restart() -> None:
+        await asyncio.sleep(1.5)  # даём договорить и отправить аудио
+        print("[JARVIS] core code changed, restarting process…", flush=True)
+        # orig_argv — команда ровно в том виде, как её запустили (`-m uvicorn`, `uv run uvicorn`…).
+        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+
+    _start_background_turn(_restart())
 
 
-async def _run_agent_turn(user_text: str) -> str:
-    """Один turn агента с OpenAI function-calling (local + MCP tools)."""
-    agent.messages.append({"role": "user", "content": user_text})
+async def _on_voice_wake() -> None:
+    await send_to_ws_safe(None, {"type": "status", "payload": "listening_mic"})
 
-    for _step in range(1, MAX_TOOL_STEPS + 1):
-        all_tools = TOOLS_SCHEMAS + await mcp_manager.get_all_tools()
-        llm_message = await agent._ask_llm(
-            agent.messages,
-            tools=all_tools,
-            return_message=True,
-        )
-        content = str(llm_message.get("content", "")).strip()
-        tool_calls = llm_message.get("tool_calls", []) or []
 
-        if not tool_calls:
-            # Совместимость: если модель по-прежнему вернула JSON с speech/action.
-            decision = agent._parse_decision(content)
-            final_speech = decision.speech or content or "Готово."
-            agent.messages.append({"role": "assistant", "content": content or final_speech})
-            return final_speech
+async def _handle_voice_command(command: str) -> None:
+    """Команда, сказанная в микрофон компьютера («Джарвис, …»)."""
+    await send_to_ws_safe(None, {"type": "text", "payload": command})
+    await send_to_ws_safe(None, {"type": "status", "payload": "thinking"})
+    try:
+        async with agent_lock:
+            final_speech = await _run_agent_turn(command)
+    except Exception as exc:  # noqa: BLE001
+        final_speech = f"Ошибка агента: {exc}"
+    await send_to_ws_safe(None, {"type": "speech_text", "payload": final_speech})
 
-        assistant_tool_call_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": content,
-            "tool_calls": tool_calls,
-        }
-        agent.messages.append(assistant_tool_call_message)
+    if _reply_locally():
+        # Отвечаем из динамиков компьютера; микрофон в это время не слушаем.
+        await send_to_ws_safe(None, {"type": "status", "payload": "executing"})
+        await _speak_locally(final_speech)
+    else:
+        try:
+            audio_b64 = await synthesize_speech_base64(final_speech)
+        except Exception:  # noqa: BLE001
+            audio_b64 = ""
+        if audio_b64:
+            await send_to_ws_safe(None, {"type": "audio", "payload": audio_b64})
+    await send_to_ws_safe(None, {"type": "status", "payload": "listening"})
+    _schedule_restart_if_needed()
 
-        for tool_call in tool_calls:
-            function_payload = tool_call.get("function", {})
-            tool_name = str(function_payload.get("name", "")).strip()
-            tool_args = _parse_tool_arguments(function_payload.get("arguments"))
-            tool_call_id = str(tool_call.get("id", "")).strip() or f"call_{_step}"
 
-            # Notify client that tool call started
-            await send_to_ws_safe(None, {
-                "type": "tool_call",
-                "payload": {
-                    "name": tool_name,
-                    "args": tool_args,
-                    "id": tool_call_id,
-                }
-            })
-
-            observation_text = await _route_tool_call(tool_name, tool_args)
-
-            # Notify client that tool call finished
-            await send_to_ws_safe(None, {
-                "type": "tool_result",
-                "payload": {
-                    "name": tool_name,
-                    "result": observation_text,
-                    "id": tool_call_id,
-                }
-            })
-
-            agent.messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": observation_text,
-                }
-            )
-
-    fallback = "Превышен лимит шагов инструментов. Уточни задачу."
-    agent.messages.append(
-        {
-            "role": "assistant",
-            "content": json.dumps(
-                {
-                    "thought": "Stopped due to MAX_TOOL_STEPS",
-                    "action": None,
-                    "speech": fallback,
-                },
-                ensure_ascii=False,
-            ),
-        }
-    )
-    return fallback
+async def _resume_interrupted_turn() -> None:
+    """Если процесс перезапустился посреди хода (самоправка ядра), доводим ход до конца."""
+    if not agent.has_interrupted_turn():
+        return
+    try:
+        async with agent_lock:
+            final_speech = await agent.resume_turn(on_event=_emit_agent_event)
+    except Exception as exc:  # noqa: BLE001
+        final_speech = f"Не удалось продолжить прерванную задачу: {exc}"
+    await trigger_proactive_message(final_speech)
 
 
 async def _handle_text_message(websocket: WebSocket, user_text: str | list[dict[str, Any]], voice: str) -> None:
     """Единый обработчик текстового запроса (из чата или из STT)."""
     await _send_status(websocket, "thinking")
+    skills_before = tools.skills_version
 
     try:
         async with agent_lock:
             final_speech = await _run_agent_turn(user_text)
+        if tools.skills_version != skills_before:
+            await _broadcast_tools()
     except Exception as exc:  # noqa: BLE001
         await send_to_ws_safe(websocket, {"type": "error", "payload": f"Agent error: {exc}"})
         await _send_status(websocket, "listening")
@@ -409,13 +449,13 @@ async def _handle_text_message(websocket: WebSocket, user_text: str | list[dict[
         audio_b64 = await synthesize_speech_base64(final_speech, voice=voice)
     except Exception as exc:  # noqa: BLE001
         await send_to_ws_safe(websocket, {"type": "error", "payload": f"TTS error: {exc}"})
-        await _send_status(websocket, "listening")
-        return
+        audio_b64 = ""
 
     if audio_b64:
         await send_to_ws_safe(websocket, {"type": "audio", "payload": audio_b64})
 
     await _send_status(websocket, "listening")
+    _schedule_restart_if_needed()
 
 
 @app.websocket("/ws/jarvis")
@@ -429,12 +469,12 @@ async def ws_jarvis(websocket: WebSocket) -> None:
 
     # Send tools list to client
     try:
-        all_tools = TOOLS_SCHEMAS + await mcp_manager.get_all_tools()
-        await send_to_ws_safe(websocket, {"type": "tools_list", "payload": all_tools})
+        await send_to_ws_safe(websocket, {"type": "tools_list", "payload": await _all_tools()})
     except Exception:
         pass
 
     await _send_status(websocket, "listening")
+    _start_background_turn(_resume_interrupted_turn())
 
     client_voice = settings.tts_voice
 
@@ -462,6 +502,12 @@ async def ws_jarvis(websocket: WebSocket) -> None:
             client_voice = str(payload).strip()
             continue
 
+        if msg_type == "reset_history":
+            async with agent_lock:
+                agent.reset()
+            await send_to_ws_safe(websocket, {"type": "speech_text", "payload": "История диалога очищена."})
+            continue
+
         if msg_type == "get_mcp_config":
             try:
                 config_path = mcp_manager.config_path
@@ -477,10 +523,8 @@ async def ws_jarvis(websocket: WebSocket) -> None:
         if msg_type == "update_mcp_config":
             try:
                 mcp_manager.config_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-                await mcp_manager.close()
-                await mcp_manager.start()
-                all_tools = TOOLS_SCHEMAS + await mcp_manager.get_all_tools()
-                await send_to_ws_safe(websocket, {"type": "tools_list", "payload": all_tools})
+                await mcp_manager.restart()
+                await send_to_ws_safe(websocket, {"type": "tools_list", "payload": await _all_tools()})
                 await send_to_ws_safe(websocket, {"type": "status", "payload": "listening"})
             except Exception as e:
                 await send_to_ws_safe(websocket, {"type": "error", "payload": f"Failed to update MCP config: {e}"})

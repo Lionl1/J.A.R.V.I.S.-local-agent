@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import shutil
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from .config import settings
 
 try:
@@ -16,6 +19,28 @@ except Exception:  # noqa: BLE001
     stdio_client = None  # type: ignore[assignment]
 
 
+# Фоновый агент (launchd, systemd, IDE) часто стартует с урезанным PATH,
+# где нет npx/uvx — ищем их и в стандартных местах установки.
+_EXTRA_BIN_DIRS = (
+    Path.home() / ".local" / "bin",
+    Path.home() / ".cargo" / "bin",
+    Path("/opt/homebrew/bin"),
+    Path("/usr/local/bin"),
+)
+
+
+def _resolve_command(command: str) -> str:
+    if os.sep in command or shutil.which(command):
+        return command
+    for directory in _EXTRA_BIN_DIRS:
+        candidate = directory / command
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    raise FileNotFoundError(
+        f"команда '{command}' не найдена ни в PATH, ни в {', '.join(map(str, _EXTRA_BIN_DIRS))}"
+    )
+
+
 @dataclass(slots=True)
 class MCPServerConfig:
     command: str
@@ -24,58 +49,121 @@ class MCPServerConfig:
 
 
 class MCPManager:
-    def __init__(self, config_path: str | Path | None = None) -> None:
+    """MCP-серверы живут в одной фоновой задаче-владельце.
+
+    stdio-контексты MCP (anyio) нужно открывать и закрывать в одной и той же задаче,
+    поэтому start() только запускает задачу, а close() просит её завершиться.
+    Сервер Джарвиса стартует сразу, не дожидаясь npx/uvx.
+    """
+
+    INIT_TIMEOUT = 60.0
+
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        on_tools_changed: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self.config_path = Path(config_path) if config_path else settings.mcp_config_path
+        self.on_tools_changed = on_tools_changed
         self._configs: dict[str, MCPServerConfig] = {}
         self._sessions: dict[str, Any] = {}
         self._tool_map: dict[str, tuple[str, str]] = {}
-        self._exit_stack: AsyncExitStack | None = None
-        self._started = False
+        self._tools_cache: list[dict[str, Any]] = []
+        self.errors: dict[str, str] = {}
+        self._task: asyncio.Task[None] | None = None
+        self._stop: asyncio.Event | None = None
+        self._ready: asyncio.Event | None = None
 
-    async def start(self) -> None:
-        """Start all MCP stdio sessions from mcp_config.json."""
-        if self._started:
+    async def start(self, wait: bool = False) -> None:
+        """Start all MCP stdio sessions from mcp_config.json in the background."""
+        if self._task is not None:
             return
+        self._stop = asyncio.Event()
+        self._ready = asyncio.Event()
+        self._task = asyncio.create_task(self._run(), name="jarvis_mcp")
+        if wait:
+            await self._ready.wait()
 
-        self._started = True
-        self._configs = self._load_configs()
+    async def wait_ready(self) -> None:
+        if self._ready is not None:
+            await self._ready.wait()
 
-        if not self._configs or stdio_client is None:
-            return
+    async def _run(self) -> None:
+        assert self._stop is not None and self._ready is not None
+        try:
+            self._configs = self._load_configs()
+            if not self._configs or stdio_client is None:
+                return
+            async with AsyncExitStack() as stack:
+                for server_name, cfg in self._configs.items():
+                    session = await self._connect(stack, server_name, cfg)
+                    if session is not None:
+                        self._sessions[server_name] = session
+                await self._refresh_tools()
+                self._ready.set()
+                if self._sessions:
+                    print(f"[MCP] ready: {', '.join(self._sessions)} ({len(self._tools_cache)} tools)", flush=True)
+                if self.on_tools_changed is not None:
+                    try:
+                        await self.on_tools_changed()
+                    except Exception:  # noqa: BLE001
+                        pass
+                await self._stop.wait()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[MCP] manager crashed: {exc}", flush=True)
+        finally:
+            self._sessions.clear()
+            self._tool_map.clear()
+            self._tools_cache = []
+            self._ready.set()
 
-        self._exit_stack = AsyncExitStack()
-
-        for server_name, cfg in self._configs.items():
+    async def _connect(self, stack: AsyncExitStack, server_name: str, cfg: MCPServerConfig) -> Any:
+        """Подключить один сервер; его падение не мешает остальным."""
+        server_stack = AsyncExitStack()
+        try:
+            command = _resolve_command(cfg.command)
+            env = dict(cfg.env)
+            bin_dir = os.path.dirname(command)
+            if bin_dir:
+                # npx/uvx сами запускают node/python через PATH — добавляем их папку.
+                env["PATH"] = os.pathsep.join([bin_dir, env.get("PATH") or os.environ.get("PATH", "")])
+            params = StdioServerParameters(command=command, args=cfg.args, env=env or None)
+            read_stream, write_stream = await server_stack.enter_async_context(stdio_client(params))
+            session = await server_stack.enter_async_context(ClientSession(read_stream, write_stream))
+            await asyncio.wait_for(session.initialize(), timeout=self.INIT_TIMEOUT)
+        except BaseException as exc:  # noqa: BLE001
+            if isinstance(exc, asyncio.CancelledError):
+                await server_stack.aclose()
+                raise
+            self.errors[server_name] = f"{type(exc).__name__}: {exc}"
+            print(f"[MCP] server '{server_name}' failed to start: {self.errors[server_name]}", flush=True)
             try:
-                params = StdioServerParameters(
-                    command=cfg.command,
-                    args=cfg.args,
-                    env=cfg.env or None,
-                )
-                read_stream, write_stream = await self._exit_stack.enter_async_context(
-                    stdio_client(params)
-                )
-                session = await self._exit_stack.enter_async_context(
-                    ClientSession(read_stream, write_stream)
-                )
-                await session.initialize()
-                self._sessions[server_name] = session
-            except Exception:
-                # Не падаем при проблеме одного сервера.
-                continue
+                await server_stack.aclose()
+            except BaseException:  # noqa: BLE001
+                pass
+            return None
+        stack.push_async_callback(server_stack.aclose)
+        return session
 
     async def close(self) -> None:
-        if self._exit_stack is not None:
-            await self._exit_stack.aclose()
-        self._exit_stack = None
-        self._sessions.clear()
-        self._tool_map.clear()
-        self._started = False
+        if self._task is None:
+            return
+        if self._stop is not None:
+            self._stop.set()
+        try:
+            await self._task
+        except BaseException:  # noqa: BLE001
+            pass
+        self._task = None
 
-    async def get_all_tools(self) -> list[dict[str, Any]]:
-        """Return all MCP tools translated to OpenAI function-calling schema."""
+    async def restart(self) -> None:
+        await self.close()
+        self.errors.clear()
+        await self.start(wait=True)
+
+    async def _refresh_tools(self) -> None:
         tools: list[dict[str, Any]] = []
-        self._tool_map.clear()
+        tool_map: dict[str, tuple[str, str]] = {}
 
         for server_name, session in self._sessions.items():
             try:
@@ -90,7 +178,7 @@ class MCPManager:
                     continue
 
                 prefixed_name = f"{server_name}__{original_name}"
-                self._tool_map[prefixed_name] = (server_name, original_name)
+                tool_map[prefixed_name] = (server_name, original_name)
 
                 parameters = getattr(tool, "inputSchema", None) or {
                     "type": "object",
@@ -110,7 +198,12 @@ class MCPManager:
                     }
                 )
 
-        return tools
+        self._tool_map = tool_map
+        self._tools_cache = tools
+
+    async def get_all_tools(self) -> list[dict[str, Any]]:
+        """Return all MCP tools translated to OpenAI function-calling schema (cached)."""
+        return list(self._tools_cache)
 
     async def execute_tool(self, tool_name: str, args: dict[str, Any]) -> str:
         """Execute MCP tool by prefixed name: <server>__<tool>."""

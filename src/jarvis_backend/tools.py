@@ -4,6 +4,8 @@ import asyncio
 import base64
 import datetime as dt
 import difflib
+import hashlib
+import inspect
 import io
 import json
 import platform
@@ -11,10 +13,12 @@ import shlex
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from duckduckgo_search import DDGS
-from openai import AsyncOpenAI
+from ddgs import DDGS
+
 from . import git_guard
+from . import skills as skills_pkg
 from .config import settings
+from .verifier import verify_change
 
 try:
     import pyautogui
@@ -37,9 +41,32 @@ _reminder_tasks: set[asyncio.Task[Any]] = set()
 CONFIRMATION_REQUIRED_TOOLS = {
     "open_application",
     "update_source_code",
+    "edit_source_code",
     "rollback_source_change",
+    "run_shell_command",
 }
 MAX_DIFF_CHARS = 20000
+MAX_SHELL_OUTPUT = 8000
+
+# Что агенту разрешено читать и править в собственном проекте.
+EDITABLE_SUFFIXES = {".py", ".md", ".html", ".css", ".js", ".json"}
+# Никогда: секреты, git, окружение, lock-файлы зависимостей.
+FORBIDDEN_PARTS = {".git", ".venv", "venv", "__pycache__", ".jarvis", "node_modules"}
+
+# Правка проверяется в песочнице (компиляция, импорт, тесты) ДО вопроса пользователю.
+VERIFY_CHANGES = settings.verify_changes
+VERIFY_TIMEOUT = settings.verify_timeout
+# (путь, sha256 содержимого) уже прошедших проверку правок — чтобы не гонять тесты дважды.
+_verified_changes: set[tuple[str, str]] = set()
+
+# Навыки (skills/*.py) — инструменты, которые агент дописывает себе сам.
+_skills = skills_pkg.SkillSet()
+# Колбэк «правила изменились» (агент перечитывает jarvis_rules.md без перезапуска).
+_rules_changed_callback: Callable[[], None] | None = None
+# Изменено ядро (не навык и не правила): нужен перезапуск процесса.
+restart_required = False
+# Растёт при каждой перезагрузке навыков — сервер по нему рассылает новый список инструментов.
+skills_version = 0
 
 ConfirmationCallback = Callable[[str, dict[str, Any], dict[str, Any]], Awaitable[bool]]
 _confirmation_callback: ConfirmationCallback | None = None
@@ -61,20 +88,35 @@ def set_confirmation_callback(callback: ConfirmationCallback | None) -> None:
     _confirmation_callback = callback
 
 
+def set_rules_changed_callback(callback: Callable[[], None] | None) -> None:
+    global _rules_changed_callback
+    _rules_changed_callback = callback
+
+
 def _resolve_source_path(file_name: str) -> Path:
-    name = (file_name or "").strip()
+    name = (file_name or "").strip().replace("\\", "/")
     if not name:
         raise ToolExecutionError("Parameter 'file_name' is required")
+    if ".." in name.split("/") or name.startswith("/"):
+        raise PermissionError("Доступ запрещен: выход за пределы песочницы проекта")
 
     # Удобный режим:
     # - tools.py -> src/jarvis_backend/tools.py
-    # - jarvis_rules.md -> <project_root>/jarvis_rules.md
-    if "/" not in name and "\\" not in name:
-        source_candidate = SOURCE_ROOT / name
-        root_candidate = PROJECT_ROOT / name
-        candidate = source_candidate if source_candidate.exists() else root_candidate
+    # - skills/weather.py -> src/jarvis_backend/skills/weather.py (в т.ч. новый файл)
+    # - jarvis_rules.md, static/index.html -> от корня проекта
+    source_candidate = SOURCE_ROOT / name
+    root_candidate = PROJECT_ROOT / name
+    first_part = name.split("/", 1)[0]
+    if source_candidate.exists():
+        candidate = source_candidate
+    elif root_candidate.exists():
+        candidate = root_candidate
+    elif "/" in name and (SOURCE_ROOT / first_part).is_dir():
+        candidate = source_candidate
+    elif "/" not in name and name.endswith(".py"):
+        candidate = source_candidate
     else:
-        candidate = PROJECT_ROOT / name
+        candidate = root_candidate
     resolved = candidate.resolve()
 
     # Защита от Path Traversal: доступ только внутри корня проекта.
@@ -87,8 +129,13 @@ def _resolve_source_path(file_name: str) -> Path:
     if not is_inside_project:
         raise PermissionError("Доступ запрещен: выход за пределы песочницы проекта")
 
-    if resolved.suffix not in {".py", ".md"}:
-        raise ToolExecutionError("Only .py and .md files are allowed")
+    rel_parts = resolved.relative_to(PROJECT_ROOT.resolve()).parts
+    if any(part in FORBIDDEN_PARTS for part in rel_parts) or resolved.name.startswith(".env"):
+        raise PermissionError("Доступ запрещен: служебный или секретный файл")
+    if resolved.suffix not in EDITABLE_SUFFIXES:
+        raise ToolExecutionError(
+            f"Разрешены только файлы {', '.join(sorted(EDITABLE_SUFFIXES))}"
+        )
 
     return resolved
 
@@ -216,41 +263,16 @@ async def analyze_screen(query: str) -> str:
         return base64.b64encode(buffer.getvalue()).decode("ascii")
 
     image_b64 = await asyncio.to_thread(_capture_and_encode)
-    data_url = f"data:image/jpeg;base64,{image_b64}"
 
-    base_url = settings.base_url
-    api_key = settings.api_key
-    # Vision идет через ту же базовую модель агента.
-    model = settings.model.strip()
+    # Vision идёт через тот же подключённый мозг (нужна мультимодальная модель).
+    from .brain import make_brain
 
-    client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=45.0)
-    response = await client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты анализируешь изображение экрана пользователя. "
-                    "Отвечай кратко, по делу, без markdown."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": normalized_query},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
-        ],
-    )
-
-    text = (response.choices[0].message.content or "").strip()
+    text = (await make_brain().describe_image(normalized_query, image_b64)).strip()
     return text or "Не удалось получить ответ vision-модели."
 
 
 async def read_source_code(file_name: str) -> str:
-    """Read project source/rules file by short file name (.py/.md)."""
+    """Read project source/rules file by short file name."""
     path = _resolve_source_path(file_name)
     if not path.exists():
         raise ToolExecutionError(f"File not found: {path}")
@@ -261,8 +283,56 @@ async def read_source_code(file_name: str) -> str:
     return await asyncio.to_thread(_read_blocking)
 
 
+async def list_source_files() -> dict[str, Any]:
+    """List files Jarvis may read/edit in its own project."""
+
+    def _list_blocking() -> list[str]:
+        root = PROJECT_ROOT.resolve()
+        found: list[str] = []
+        for path in sorted(root.rglob("*")):
+            rel = path.relative_to(root)
+            if not path.is_file() or path.suffix not in EDITABLE_SUFFIXES:
+                continue
+            if any(part in FORBIDDEN_PARTS or part.startswith(".") for part in rel.parts):
+                continue
+            found.append(f"{rel.as_posix()} ({path.stat().st_size} B)")
+        return found
+
+    files = await asyncio.to_thread(_list_blocking)
+    return {
+        "ok": True,
+        "tool": "list_source_files",
+        "result": files,
+        "skills": sorted(_skills.functions),
+        "skill_errors": dict(_skills.errors),
+    }
+
+
+def _apply_edit(path: Path, old_text: Any, new_text: Any) -> str:
+    """Точечная замена: old_text должен встречаться в файле ровно один раз."""
+    if not path.exists():
+        raise ToolExecutionError(f"File not found: {path.name}. Для нового файла используйте update_source_code")
+    old = old_text if isinstance(old_text, str) else str(old_text or "")
+    new = new_text if isinstance(new_text, str) else str(new_text or "")
+    if not old:
+        raise ToolExecutionError("Parameter 'old_text' is required")
+    current = path.read_text(encoding="utf-8")
+    count = current.count(old)
+    if count == 0:
+        raise ToolExecutionError(
+            "old_text не найден в файле. Прочитайте файл заново (read_source_code) и скопируйте фрагмент дословно."
+        )
+    if count > 1:
+        raise ToolExecutionError(f"old_text встречается {count} раз(а) — добавьте окружающие строки, чтобы фрагмент был уникален")
+    return current.replace(old, new, 1)
+
+
+def _content_key(path: Path, content: str) -> tuple[str, str]:
+    return str(path), hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def _prepare_source_update(file_name: str, new_content: Any) -> tuple[Path, str]:
-    """Validate an update before asking the user: path sandbox, syntax, git state."""
+    """Validate an update before asking the user: path sandbox, syntax, git state, sandbox tests."""
     path = _resolve_source_path(file_name)
     content = new_content if isinstance(new_content, str) else str(new_content)
 
@@ -278,7 +348,20 @@ def _prepare_source_update(file_name: str, new_content: Any) -> tuple[Path, str]
 
     git_guard.ensure_repo(PROJECT_ROOT)
     git_guard.ensure_file_clean(PROJECT_ROOT, path)
+
+    key = _content_key(path, content)
+    if VERIFY_CHANGES and key not in _verified_changes:
+        rel = path.relative_to(PROJECT_ROOT).as_posix()
+        result = verify_change(PROJECT_ROOT, {rel: content}, timeout=VERIFY_TIMEOUT)
+        if not result.ok:
+            raise ToolExecutionError(result.summary() + "\nФайл НЕ обновлен. Исправьте код и попробуйте снова.")
+        _verified_changes.add(key)
     return path, content
+
+
+def _prepare_source_edit(file_name: str, old_text: Any, new_text: Any) -> tuple[Path, str]:
+    path = _resolve_source_path(file_name)
+    return _prepare_source_update(file_name, _apply_edit(path, old_text, new_text))
 
 
 def _source_diff(path: Path, content: str) -> str:
@@ -297,9 +380,7 @@ def _source_diff(path: Path, content: str) -> str:
     return diff or "(изменений нет)"
 
 
-async def update_source_code(file_name: str, new_content: str) -> dict[str, Any]:
-    """Update .py/.md file: syntax check, git snapshot commit, then write to disk."""
-    path, content = _prepare_source_update(file_name, new_content)
+async def _commit_source_change(path: Path, content: str, tool_name: str) -> dict[str, Any]:
     rel = path.relative_to(PROJECT_ROOT).as_posix()
 
     def _commit_and_write_blocking() -> str:
@@ -312,15 +393,48 @@ async def update_source_code(file_name: str, new_content: str) -> dict[str, Any]
         return sha
 
     sha = await asyncio.to_thread(_commit_and_write_blocking)
+    _verified_changes.discard(_content_key(path, content))
+    note = _after_change(path)
     return {
         "ok": True,
-        "tool": "update_source_code",
+        "tool": tool_name,
         "result": (
-            f"Код обновлен и закоммичен ({sha[:8]}). Сервер сейчас будет перезагружен. "
+            f"Изменение {rel} закоммичено ({sha[:8]}). {note} "
             "Откат: инструмент rollback_source_change или `make rollback`."
         ),
         "commit": sha,
     }
+
+
+def _after_change(path: Path) -> str:
+    """Подхватить изменение без перезапуска, где это возможно."""
+    global restart_required
+    resolved = path.resolve()
+    if resolved == settings.rules_path.resolve():
+        if _rules_changed_callback is not None:
+            _rules_changed_callback()
+        return "Правила перечитаны — действуют со следующего ответа."
+    if resolved.parent == (SOURCE_ROOT / "skills").resolve():
+        reload_skills()
+        if _skills.errors:
+            return f"Навыки перезагружены, но есть ошибки: {_skills.errors}."
+        return f"Навыки перезагружены: {', '.join(sorted(_skills.functions)) or 'нет'}."
+    if resolved.suffix == ".py":
+        restart_required = True
+        return "Ядро изменено — процесс будет перезапущен, история диалога сохранится."
+    return "Изменение сохранено."
+
+
+async def update_source_code(file_name: str, new_content: str) -> dict[str, Any]:
+    """Create/replace a whole project file: verify, git snapshot commit, then write to disk."""
+    path, content = await asyncio.to_thread(_prepare_source_update, file_name, new_content)
+    return await _commit_source_change(path, content, "update_source_code")
+
+
+async def edit_source_code(file_name: str, old_text: str, new_text: str) -> dict[str, Any]:
+    """Replace one unique fragment of a project file (safer than rewriting the whole file)."""
+    path, content = await asyncio.to_thread(_prepare_source_edit, file_name, old_text, new_text)
+    return await _commit_source_change(path, content, "edit_source_code")
 
 
 async def rollback_source_change() -> dict[str, Any]:
@@ -338,16 +452,28 @@ async def rollback_source_change() -> dict[str, Any]:
 
 def describe_tool_call(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Human-readable details for a confirmation prompt; raises if the call is invalid."""
-    if tool_name == "update_source_code":
-        path, content = _prepare_source_update(
-            args.get("file_name", ""), args.get("new_content", "")
-        )
+    if tool_name in {"update_source_code", "edit_source_code"}:
+        if tool_name == "update_source_code":
+            path, content = _prepare_source_update(
+                args.get("file_name", ""), args.get("new_content", "")
+            )
+        else:
+            path, content = _prepare_source_edit(
+                args.get("file_name", ""), args.get("old_text", ""), args.get("new_text", "")
+            )
         rel = path.relative_to(PROJECT_ROOT).as_posix()
         action = "Изменить" if path.exists() else "Создать"
+        checked = " Проверка в песочнице пройдена." if VERIFY_CHANGES and path.suffix == ".py" else ""
         return {
-            "summary": f"{action} файл {rel} (изменение будет закоммичено в git)",
+            "summary": f"{action} файл {rel} (изменение будет закоммичено в git).{checked}",
             "diff": _source_diff(path, content),
         }
+
+    if tool_name == "run_shell_command":
+        command = str(args.get("command", "")).strip()
+        if not command:
+            raise ToolExecutionError("Parameter 'command' is required")
+        return {"summary": f"Выполнить команду: {command}", "diff": command}
 
     if tool_name == "rollback_source_change":
         info = git_guard.last_agent_commit(PROJECT_ROOT)
@@ -363,6 +489,76 @@ def describe_tool_call(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         return {"summary": f"Запустить приложение: {app_name}"}
 
     return {"summary": f"Выполнить {tool_name}"}
+
+
+async def run_shell_command(command: str, timeout: float | None = None) -> dict[str, Any]:
+    """Run a shell command on the user's machine (always confirmed by the user)."""
+    command = (command or "").strip()
+    if not command:
+        raise ToolExecutionError("Parameter 'command' is required")
+    limit = min(float(timeout or settings.shell_timeout), 600.0)
+    process = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=str(Path.home()),
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=limit)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise ToolExecutionError(f"Команда не завершилась за {limit:.0f} c и была остановлена")
+    output = stdout.decode("utf-8", errors="replace")
+    if len(output) > MAX_SHELL_OUTPUT:
+        output = output[:MAX_SHELL_OUTPUT] + "\n... (вывод обрезан)"
+    return {
+        "ok": process.returncode == 0,
+        "tool": "run_shell_command",
+        "exit_code": process.returncode,
+        "result": output,
+    }
+
+
+async def stop_jarvis() -> dict[str, Any]:
+    """Shut Jarvis down (until the next login / manual start)."""
+    import os
+    import signal
+
+    async def _stop_later() -> None:
+        await asyncio.sleep(4.0)  # даём договорить ответ
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    task = asyncio.create_task(_stop_later(), name="jarvis_stop")
+    _reminder_tasks.add(task)
+    return {
+        "ok": True,
+        "tool": "stop_jarvis",
+        "result": "Джарвис завершит работу через несколько секунд. Снова включить: make on или вход в систему.",
+    }
+
+
+def reload_skills() -> skills_pkg.SkillSet:
+    """(Пере)загрузить навыки из skills/*.py."""
+    global _skills, skills_version
+    _skills = skills_pkg.load_skills(reserved_names=set(TOOL_REGISTRY))
+    skills_version += 1
+    for name, error in _skills.errors.items():
+        print(f"[WARN] Skill '{name}' failed to load: {error}")
+    return _skills
+
+
+def skill_load_errors() -> dict[str, str]:
+    return dict(_skills.errors)
+
+
+def get_tool_schemas() -> list[dict[str, Any]]:
+    """Встроенные инструменты + навыки (без MCP)."""
+    return [*TOOLS_SCHEMAS, *_skills.schemas]
+
+
+def is_local_tool(tool_name: str) -> bool:
+    return tool_name in TOOL_REGISTRY or tool_name in _skills.functions
 
 
 async def set_reminder(minutes: int, reminder_text: str) -> str:
@@ -396,9 +592,13 @@ TOOL_REGISTRY = {
     "web_search": web_search,
     "analyze_screen": analyze_screen,
     "read_source_code": read_source_code,
+    "list_source_files": list_source_files,
     "update_source_code": update_source_code,
+    "edit_source_code": edit_source_code,
     "rollback_source_change": rollback_source_change,
+    "run_shell_command": run_shell_command,
     "set_reminder": set_reminder,
+    "stop_jarvis": stop_jarvis,
 }
 
 
@@ -482,7 +682,10 @@ TOOLS_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_source_code",
-            "description": "Read project source/rules file by file name (e.g., tools.py or jarvis_rules.md).",
+            "description": (
+                "Read one of your own project files: source (tools.py, agent.py, skills/<name>.py), "
+                "rules (jarvis_rules.md) or UI (static/index.html)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -498,10 +701,38 @@ TOOLS_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_source_files",
+            "description": "List your own project files you can read and edit, plus loaded skills and skill load errors.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_source_code",
+            "description": (
+                "Preferred way to change your own code/rules: replace one exact, unique fragment of a file. "
+                "The change is compiled, imported and tested in a sandbox first; on failure you get the error "
+                "output and should fix it. Then the user approves the diff and it is committed to git."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_name": {"type": "string", "description": "e.g. 'tools.py', 'skills/weather.py', 'jarvis_rules.md'."},
+                    "old_text": {"type": "string", "description": "Exact fragment copied from the current file (must be unique)."},
+                    "new_text": {"type": "string", "description": "Replacement text."},
+                },
+                "required": ["file_name", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "update_source_code",
             "description": (
-                "Update project source/rules file; .py content is syntax-checked before save. "
-                "Requires user confirmation; the change is committed to git."
+                "Create a new file or fully rewrite one (use for new skills in skills/<name>.py). "
+                "Verified in a sandbox (compile, import, tests), then the user approves the diff; committed to git."
             ),
             "parameters": {
                 "type": "object",
@@ -512,7 +743,7 @@ TOOLS_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "new_content": {
                         "type": "string",
-                        "description": "Full new Python source code content for the file.",
+                        "description": "Full new content of the file.",
                     },
                 },
                 "required": ["file_name", "new_content"],
@@ -526,6 +757,35 @@ TOOLS_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "Revert the latest change made by update_source_code (git revert). "
                 "Works only if the last commit was made by the agent. Requires user confirmation."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell_command",
+            "description": (
+                "Run a shell command on the user's computer (cwd = home directory) and get its output. "
+                "Use for system control the other tools do not cover. Always requires user confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute."},
+                    "timeout": {"type": "number", "description": "Seconds before the command is killed (default 60)."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_jarvis",
+            "description": (
+                "Shut yourself down completely (stop listening to the microphone and exit). "
+                "Use ONLY when the user directly asks you to turn off / shut down / stop working."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -557,11 +817,13 @@ LOCAL_TOOL_NAMES = {
     item["function"]["name"] for item in TOOLS_SCHEMAS if item.get("type") == "function"
 }
 
+reload_skills()
+
 
 async def execute_tool(tool_name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
     """Execute a tool by name with JSON-compatible args."""
     args = args or {}
-    tool = TOOL_REGISTRY.get(tool_name)
+    tool = TOOL_REGISTRY.get(tool_name) or _skills.functions.get(tool_name)
 
     if tool is None:
         return {
@@ -571,7 +833,7 @@ async def execute_tool(tool_name: str, args: dict[str, Any] | None = None) -> di
         }
 
     try:
-        if tool_name in CONFIRMATION_REQUIRED_TOOLS:
+        if tool_name in CONFIRMATION_REQUIRED_TOOLS or tool_name in _skills.confirm:
             # Валидируем до вопроса пользователю, чтобы не спрашивать о заведомо невыполнимом.
             details = await asyncio.to_thread(describe_tool_call, tool_name, args)
             approved = False
@@ -581,12 +843,17 @@ async def execute_tool(tool_name: str, args: dict[str, Any] | None = None) -> di
                 return {
                     "ok": False,
                     "tool": tool_name,
+                    "done": False,
                     "error": (
-                        "Пользователь не подтвердил выполнение. "
+                        "ОТМЕНЕНО: пользователь не подтвердил выполнение, ничего не сделано. "
+                        "Честно скажи пользователю, что действие НЕ выполнено. "
                         "Не повторяй вызов без новой просьбы пользователя."
                     ),
                 }
-        return await tool(**args)
+        result = tool(**args)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
     except PermissionError as exc:
         return {
             "ok": False,

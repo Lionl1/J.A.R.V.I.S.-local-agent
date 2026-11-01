@@ -18,11 +18,17 @@ dependencies = [
   "mcp>=1.2.0",
   "python-dotenv>=1.0.1",
   "SpeechRecognition>=3.10.0",
-  "duckduckgo-search>=7.0.0",
   "watchdog>=4.0.1",
   "pyautogui>=0.9.54",
   "Pillow>=10.4.0",
   "PyAudio>=0.2.14",
+  "anthropic>=2.3.0",
+  "ddgs>=9.16.1",
+]
+
+[project.optional-dependencies]
+wakeword = [
+    "openwakeword>=0.6.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -40,3 +46,10 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.1",
+]

@@ -39,4 +39,7 @@ def tools_in_repo(repo: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(tools, "PROJECT_ROOT", repo)
     monkeypatch.setattr(tools, "SOURCE_ROOT", repo / "src" / "jarvis_backend")
     monkeypatch.setattr(tools, "_confirmation_callback", None)
+    # Песочница проверяет настоящий проект; во временном репо её гоняют отдельные тесты.
+    monkeypatch.setattr(tools, "VERIFY_CHANGES", False)
+    monkeypatch.setattr(tools, "restart_required", False)
     return tools
