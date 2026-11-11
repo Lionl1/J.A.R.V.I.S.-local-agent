@@ -88,6 +88,13 @@ def set_confirmation_callback(callback: ConfirmationCallback | None) -> None:
     _confirmation_callback = callback
 
 
+async def confirm_with_user(tool_name: str, args: dict[str, Any], details: dict[str, Any]) -> bool:
+    """Ask the user through the registered callback; without one the answer is "no"."""
+    if _confirmation_callback is None:
+        return False
+    return await _confirmation_callback(tool_name, args, details)
+
+
 def set_rules_changed_callback(callback: Callable[[], None] | None) -> None:
     global _rules_changed_callback
     _rules_changed_callback = callback
