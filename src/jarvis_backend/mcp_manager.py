@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import os
 import shutil
@@ -41,6 +42,24 @@ def _resolve_command(command: str) -> str:
     )
 
 
+# Тот же ответ, что получает модель при отказе в локальном инструменте.
+DENIED_TEXT = (
+    "ОТМЕНЕНО: пользователь не подтвердил выполнение, ничего не сделано. "
+    "Честно скажи пользователю, что действие НЕ выполнено. "
+    "Не повторяй вызов без новой просьбы пользователя."
+)
+
+ConfirmCallback = Callable[[str, dict[str, Any], dict[str, Any]], Awaitable[bool]]
+
+
+def _declared_read_only(tool: Any) -> bool:
+    """True only if the server marks the tool as not changing anything (readOnlyHint)."""
+    annotations = getattr(tool, "annotations", None)
+    return any(
+        getattr(annotations, name, None) is True for name in ("readOnlyHint", "read_only_hint")
+    )
+
+
 @dataclass(slots=True)
 class MCPServerConfig:
     command: str
@@ -62,9 +81,16 @@ class MCPManager:
         self,
         config_path: str | Path | None = None,
         on_tools_changed: Callable[[], Awaitable[None]] | None = None,
+        confirm: ConfirmCallback | None = None,
+        auto_approve: tuple[str, ...] | None = None,
     ) -> None:
         self.config_path = Path(config_path) if config_path else settings.mcp_config_path
         self.on_tools_changed = on_tools_changed
+        # Аргументы MCP-вызова может подсунуть prompt injection (веб, экран, ответ другого
+        # сервера), поэтому всё, что сервер не объявил read-only, подтверждает человек.
+        self.confirm = confirm
+        self.auto_approve = settings.mcp_auto_approve if auto_approve is None else auto_approve
+        self._read_only: set[str] = set()
         self._configs: dict[str, MCPServerConfig] = {}
         self._sessions: dict[str, Any] = {}
         self._tool_map: dict[str, tuple[str, str]] = {}
@@ -164,6 +190,7 @@ class MCPManager:
     async def _refresh_tools(self) -> None:
         tools: list[dict[str, Any]] = []
         tool_map: dict[str, tuple[str, str]] = {}
+        read_only: set[str] = set()
 
         for server_name, session in self._sessions.items():
             try:
@@ -179,6 +206,8 @@ class MCPManager:
 
                 prefixed_name = f"{server_name}__{original_name}"
                 tool_map[prefixed_name] = (server_name, original_name)
+                if _declared_read_only(tool):
+                    read_only.add(prefixed_name)
 
                 parameters = getattr(tool, "inputSchema", None) or {
                     "type": "object",
@@ -200,6 +229,14 @@ class MCPManager:
 
         self._tool_map = tool_map
         self._tools_cache = tools
+        self._read_only = read_only
+
+    def needs_confirmation(self, tool_name: str) -> bool:
+        """Everything except tools the server declares read-only or the user allowed in
+        JARVIS_MCP_AUTO_APPROVE (names or patterns such as `memory__*`)."""
+        if tool_name in self._read_only:
+            return False
+        return not any(fnmatch.fnmatchcase(tool_name, pattern) for pattern in self.auto_approve)
 
     async def get_all_tools(self) -> list[dict[str, Any]]:
         """Return all MCP tools translated to OpenAI function-calling schema (cached)."""
@@ -215,6 +252,15 @@ class MCPManager:
         session = self._sessions.get(server_name)
         if session is None:
             return f"Ошибка при обращении к серверу: MCP сервер '{server_name}' неактивен"
+
+        if self.needs_confirmation(tool_name):
+            details = {
+                "summary": f"Вызвать MCP-инструмент {original_name} сервера «{server_name}»",
+                "diff": json.dumps(args or {}, ensure_ascii=False, indent=2, default=str),
+            }
+            # Без обработчика подтверждения — отказ (fail closed), как у локальных инструментов.
+            if self.confirm is None or not await self.confirm(tool_name, args or {}, details):
+                return DENIED_TEXT
 
         try:
             result = await session.call_tool(original_name, arguments=args or {})

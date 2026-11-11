@@ -88,7 +88,7 @@ def _restart_process() -> None:
 
 async def main() -> None:
     """Точка входа в бесконечный Agentic Loop."""
-    mcp_manager = MCPManager()
+    mcp_manager = MCPManager(confirm=tools.confirm_with_user)
 
     async def all_tools() -> list[dict]:
         return tools.get_tool_schemas() + await mcp_manager.get_all_tools()

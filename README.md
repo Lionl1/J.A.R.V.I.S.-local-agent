@@ -61,6 +61,7 @@ New abilities go into `src/jarvis_backend/skills/<name>.py` (see `skills/__init_
 - **Self-Modifying Code**: see the RSI loop above.
 - **System control**: `run_shell_command`, `open_application`, screen analysis, web search, reminders, MCP servers and skills.
 - **Confirmation for sensitive tools**: `edit_source_code`, `update_source_code`, `rollback_source_change`, `run_shell_command` and `open_application` run only after the user clicks "Allow" in the web UI (or answers `y` in the console). No answer within `JARVIS_CONFIRM_TIMEOUT` seconds (default 120) or a disconnect means "deny".
+- **Confirmation for MCP tools**: a call to an MCP server is confirmed the same way, unless the server marks the tool as read-only (`readOnlyHint`). Tools you trust can be listed in `JARVIS_MCP_AUTO_APPROVE` (names or patterns, e.g. `memory__*,sqlite__read_query`) to run without asking.
 - **MCP Integration**: Connect external MCP servers using `mcp_config.json` and automatically route tool calls.
 - **Fast Local TTS/STT**: Fast speech synthesis via `edge-tts` and high-speed local audio transcription via `faster-whisper`.
 - **Flexible Tool Calling**: Desktop application control, web search, visual screen analysis (vision model), timers, and reminders.
