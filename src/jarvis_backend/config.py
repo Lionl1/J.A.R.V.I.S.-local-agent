@@ -122,6 +122,7 @@ class Settings:
     trigger_watch_dir: str | None
     debug_text_mode: bool
     confirm_timeout: float
+    mcp_auto_approve: tuple[str, ...]
 
     wake_word: bool
     wake_engine: str
@@ -194,6 +195,11 @@ class Settings:
             trigger_watch_dir=_env_optional_str("JARVIS_TRIGGER_DIR"),
             debug_text_mode=_env_bool("JARVIS_DEBUG_TEXT_MODE", False),
             confirm_timeout=max(5.0, _env_float("JARVIS_CONFIRM_TIMEOUT", 120.0)),
+            mcp_auto_approve=tuple(
+                item.strip()
+                for item in _env_str("JARVIS_MCP_AUTO_APPROVE", "").split(",")
+                if item.strip()
+            ),
             wake_word=_env_bool("JARVIS_WAKE_WORD", False),
             wake_engine=_env_str("JARVIS_WAKE_ENGINE", "whisper").lower(),
             wake_threshold=_env_float("JARVIS_WAKE_THRESHOLD", 0.5),

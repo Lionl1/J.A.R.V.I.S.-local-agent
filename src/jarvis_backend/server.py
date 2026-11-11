@@ -25,6 +25,7 @@ from .mcp_manager import MCPManager
 from .triggers import DirectoryWatcher
 from .wake import VoiceListener
 from .tools import (
+    confirm_with_user,
     execute_tool,
     get_tool_schemas,
     is_local_tool,
@@ -67,7 +68,7 @@ agent = AgentCore(
 )
 # Lock защищает историю сообщений от гонок при параллельных запросах/сокетах.
 agent_lock: asyncio.Lock = asyncio.Lock()
-mcp_manager = MCPManager(on_tools_changed=_broadcast_tools)
+mcp_manager = MCPManager(on_tools_changed=_broadcast_tools, confirm=confirm_with_user)
 active_websocket: WebSocket | None = None
 websocket_send_lock: asyncio.Lock = asyncio.Lock()
 directory_watcher: DirectoryWatcher | None = None
